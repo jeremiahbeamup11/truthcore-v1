@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
+from dotenv import load_dotenv
+import os
 
+load_dotenv()  # Load variables from .env file
 app = FastAPI(title="TruthCore v1", version="1.0")
 
 class AnalyzeRequest(BaseModel):
@@ -28,7 +31,7 @@ def health_check():
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze_article(request: AnalyzeRequest):
-    # Placeholder logic (we'll replace with real xAI + Serpi calls later)
+    print("XAI_API_KEY loaded:", bool(os.getenv("XAI_API_KEY")))
     sample_claims = [
         Claim(
             text="The event happened on January 15th, 2025.",
