@@ -1,3 +1,4 @@
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
@@ -9,6 +10,15 @@ from xai_sdk.chat import user, system  # Important: Import these wrappers
 load_dotenv()  # Load variables from .env file
 
 app = FastAPI(title="TruthCore v1", version="1.0")
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Or ["*"] for testing
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class AnalyzeRequest(BaseModel):
     url: str
