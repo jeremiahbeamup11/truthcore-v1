@@ -10,7 +10,13 @@ from xai_sdk.chat import user, system  # Important: Import these wrappers
 load_dotenv()  # Load variables from .env file
 
 app = FastAPI(title="TruthCore v1", version="1.0")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For testing; change to ["https://your-vercel-url.vercel.app"] for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.add_middleware(
     CORSMiddleware,
