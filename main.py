@@ -13,15 +13,11 @@ app = FastAPI(title="TruthCore v1", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For testing; change to ["https://truthcore-frontend.vercel.app"] once stable
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Or ["*"] for testing
+    allow_origins=[
+        "http://localhost:3000",  # Keep for local testing
+        "https://truthcore-frontend.vercel.app",  # Add for live Vercel frontend
+        # Add any other origins if needed, e.g., custom domain later
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
