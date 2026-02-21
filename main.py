@@ -58,12 +58,8 @@ async def analyze_article(request: AnalyzeRequest):
         response = requests.get(request.url, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-        # Extract main text (simple heuristic - improve later)
         article_text = ' '.join([p.text for p in soup.find_all('p')])
         article_text = article_text[:4000]  # Limit for API
-        print("=== ARTICLE TEXT SNIPPET ===")
-        print(article_text[:300])
-        print("=== END ARTICLE ===")
     except Exception as e:
         return AnalyzeResponse(
             url=request.url,
@@ -72,45 +68,34 @@ async def analyze_article(request: AnalyzeRequest):
             status=f"error: Failed to fetch article - {str(e)}"
         )
     
-    # Step 2: Use xAI SDK for claims extraction
+    # Step 2: Use xAI SDK for initial claim extraction (focus on core assertions)
     try:
         client = Client(
             api_key=xai_api_key,
-            timeout=3600  # Longer timeout for reasoning
+            timeout=3600
         )
         
-        # Create chat session
         chat = client.chat.create(
-            model="grok-4",  # Switch to a more advanced model
+            model="grok-4",
             store_messages=False
         )
         
-        # Append system and user messages using wrappers
-        chat.append(system("You are a precise fact-extraction AI. Always output at least 3 claims if possible, even if low confidence. Use JSON array format strictly. Complete the JSON fully."))
+        chat.append(system("You are a precise fact-extraction AI. Extract verifiable claims, focusing on the core assertion (e.g., the action or statement) rather than peripheral details like titles or dates. If a detail seems outdated or minor, flag it but don't lower confidence for the main claim. Always output at least 3 claims if possible, even if low confidence. Use JSON array format strictly. Complete the JSON fully."))
         
         prompt = f"""
-Extract at least 3 verifiable claims from this article text. Output ONLY a JSON array of objects, each with:
+Extract at least 3 verifiable claims from this article text. For each:
 - "text": The exact claim statement
-- "confidence": A float 0.0-1.0 estimating truth probability based on your knowledge
-- "explanation": Brief reasoning and sources if possible
+- "confidence": A float 0.0-1.0 estimating truth probability based on your knowledge (focus on core, flag minor issues)
+- "explanation": Brief reasoning and sources if possible; suggest search terms for verification if confidence low
 
-Example output: 
-[{{"text": "Example claim 1", "confidence": 0.95, "explanation": "Reasoning 1"}}, {{"text": "Example claim 2", "confidence": 0.8, "explanation": "Reasoning 2"}}]
-
-No other text, no introduction, just the JSON array. Make sure to close the array properly.
+Output ONLY a JSON array of objects. No other text.
 
 Article: {article_text}
         """
         chat.append(user(prompt))
         
-        # Get response using stream to collect full content
-        claims_raw = ""
-        for response, chunk in chat.stream():
-            if chunk.content:
-                claims_raw += chunk.content
-        print("=== RAW XAI OUTPUT ===")
-        print(repr(claims_raw))  # Full raw
-        print("=== END RAW ===")
+        response = chat.sample()
+        claims_raw = response.content[0]
         
         # Parse as JSON
         import json
@@ -123,9 +108,31 @@ Article: {article_text}
                     confidence=item["confidence"],
                     explanation=item["explanation"]
                 ))
-        except json.JSONDecodeError as parse_e:
-            print(f"JSON Parse Error: {str(parse_e)}")  # Debug in terminal
+        except json.JSONDecodeError:
             claims = []
+        
+        # Step 3: Use Serpi AI for up-to-date verification (cross-check each claim)
+        if claims:
+            for claim in claims:
+                if claim.confidence < 0.5:  # Only search low-confidence claims to save costs
+                    try:
+                        serpi_url = "https://serpapi.com/search"  # Serpi API endpoint
+                        params = {
+                            "q": claim.text,  # Search the claim directly for verification
+                            "api_key": serpi_api_key,
+                            "num": 5  # Top 5 results for evidence
+                        }
+                        serpi_resp = requests.get(serpi_url, params=params)
+                        serpi_resp.raise_for_status()
+                        serpi_results = serpi_resp.json()
+                        # Simple evidence aggregation (improve later)
+                        evidence = [result['snippet'] for result in serpi_results.get('organic_results', [])[:3]]
+                        claim.explanation += f" (Verified evidence: {'; '.join(evidence)})"
+                        # Boost confidence if evidence supports
+                        if any("confirm" in snippet.lower() or "true" in snippet.lower() for snippet in evidence):
+                            claim.confidence = min(1.0, claim.confidence + 0.3)  # Boost by 30%
+                    except Exception as search_e:
+                        claim.explanation += f" (Search verification failed: {str(search_e)})"
         
         overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
         
