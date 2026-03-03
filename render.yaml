@@ -1,0 +1,15 @@
+cat > render.yaml << 'EOF'
+services:
+  - type: web
+    name: veracity-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: XAI_API_KEY
+        sync: false
+      - key: TIKTOK_COOKIES
+        sync: false
+      - key: INSTAGRAM_COOKIES
+        sync: false
+EOF
