@@ -43,15 +43,22 @@ class AnalyzeResponse(BaseModel):
 
 def get_cookie_file(env_var: str, filename: str) -> str | None:
     """
-    Reads cookie content from an environment variable,
-    writes it to a temp file, and returns the path.
+    Reads base64-encoded cookie content from an environment variable,
+    decodes it, writes to a temp file, and returns the path.
     Falls back to local paths in development.
     """
+    import base64
     content = os.getenv(env_var)
     if content:
         path = f'/tmp/{filename}'
+        try:
+            # Try base64 decode first
+            decoded = base64.b64decode(content).decode('utf-8')
+        except Exception:
+            # Fall back to raw content if not base64
+            decoded = content
         with open(path, 'w') as f:
-            f.write(content)
+            f.write(decoded)
         return path
 
     # Local dev fallbacks
