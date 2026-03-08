@@ -138,14 +138,17 @@ def download_audio(url: str) -> str:
     return audio_file
 
 def transcribe_audio(audio_file: str) -> str:
-    """Transcribes audio file using Whisper."""
-    import whisper
-    import ssl
+    """Transcribes audio file using AssemblyAI."""
+    import assemblyai as aai
 
-    ssl._create_default_https_context = ssl._create_unverified_context
-    model = whisper.load_model("base")
-    result = model.transcribe(audio_file)
-    return result["text"].strip()
+    aai.settings.api_key = os.getenv("ASSEMBLYAI_API_KEY")
+    transcriber = aai.Transcriber()
+    transcript = transcriber.transcribe(audio_file)
+
+    if transcript.status == aai.TranscriptStatus.error:
+        raise Exception(f"AssemblyAI transcription error: {transcript.error}")
+
+    return transcript.text.strip()
 
 def call_grok(api_key: str, system_prompt: str, user_prompt: str, model: str = "grok-3") -> str:
     """
