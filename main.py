@@ -168,7 +168,8 @@ def transcribe_audio(audio_file: str) -> str:
     import assemblyai as aai
 
     aai.settings.api_key = os.getenv("ASSEMBLYAI_API_KEY")
-    transcriber = aai.Transcriber()
+    config = aai.TranscriptionConfig(speech_model=aai.SpeechModel.universal)
+    transcriber = aai.Transcriber(config=config)
     transcript = transcriber.transcribe(audio_file)
 
     if transcript.status == aai.TranscriptStatus.error:
