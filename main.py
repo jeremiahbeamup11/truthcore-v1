@@ -33,6 +33,8 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "https://truthcore-frontend.vercel.app",
+    "https://truthcore.ai",
+    "https://www.truthcore.ai",
 ]
 
 VERCEL_PROJECT = os.getenv("VERCEL_PROJECT_NAME", "truthcore-frontend")
