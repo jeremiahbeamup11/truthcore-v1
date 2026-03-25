@@ -211,11 +211,11 @@ def transcribe_audio(audio_file: str) -> str:
 
     return transcript.text.strip()
 
-def call_grok(api_key: str, system_prompt: str, user_prompt: str, model: str = "grok-3") -> str:
+def call_perplexity(api_key: str, system_prompt: str, user_prompt: str, model: str = "sonar") -> str:
     import requests
 
     response = requests.post(
-        "https://api.x.ai/v1/chat/completions",
+        "https://api.perplexity.ai/chat/completions",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -270,7 +270,7 @@ Transcript:
 
 Return format: [{{"text": "claim here"}}, {{"text": "another claim"}}]"""
 
-    raw = call_grok(api_key, system_prompt, user_prompt)
+    raw = call_perplexity(api_key, system_prompt, user_prompt)
     print("Raw claims extraction response:", repr(raw[:200]))
     claims = extract_json_from_response(raw)
     return claims[:MAX_CLAIMS]
@@ -314,7 +314,7 @@ Each item must have exactly this format:
 Claims to fact-check:
 {claims_formatted}"""
 
-    raw = call_grok(api_key, system_prompt, user_prompt, model="grok-3")
+    raw = call_perplexity(api_key, system_prompt, user_prompt)
     print("Raw fact-check response:", repr(raw[:300]))
     return extract_json_from_response(raw)
 
@@ -333,8 +333,8 @@ def health_check():
 @app.post("/analyze", response_model=AnalyzeResponse)
 @limiter.limit("10/minute")
 async def analyze_article(request: Request, body: AnalyzeRequest):
-    xai_api_key = os.getenv("XAI_API_KEY")
-    if not xai_api_key:
+    perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+    if not perplexity_api_key:
         raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
 
     import requests as req
@@ -356,9 +356,9 @@ async def analyze_article(request: Request, body: AnalyzeRequest):
                                status="error: No readable text found in that article.")
 
     try:
-        raw_claims = extract_claims_from_transcript(article_text, xai_api_key)
+        raw_claims = extract_claims_from_transcript(article_text, perplexity_api_key)
         claims_text = [c.get("text", "") for c in raw_claims if c.get("text")]
-        fact_checked = fact_check_claims(claims_text, xai_api_key)
+        fact_checked = fact_check_claims(claims_text, perplexity_api_key)
 
         claims = [Claim(
             text=item.get("text", ""),
@@ -383,8 +383,8 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     print(f"\n=== Starting video analysis ===")
     print(f"Platform: {detect_platform(body.url)}")
 
-    xai_api_key = os.getenv("XAI_API_KEY")
-    if not xai_api_key:
+    perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+    if not perplexity_api_key:
         raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
 
     # Step 1: Download audio
@@ -421,7 +421,7 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     # Step 3: Extract claims
     print("\n[Step 3] Extracting claims...")
     try:
-        raw_claims = extract_claims_from_transcript(transcript, xai_api_key)
+        raw_claims = extract_claims_from_transcript(transcript, perplexity_api_key)
         claims_text = [c.get("text", "") for c in raw_claims if c.get("text")]
         print(f"Extracted {len(claims_text)} claims")
     except Exception as e:
@@ -436,7 +436,7 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     # Step 4: Fact-check
     print("\n[Step 4] Fact-checking claims...")
     try:
-        fact_checked = fact_check_claims(claims_text, xai_api_key)
+        fact_checked = fact_check_claims(claims_text, perplexity_api_key)
         print(f"Fact-checked {len(fact_checked)} claims")
     except Exception as e:
         print(f"Fact-check error: {e}")
