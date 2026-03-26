@@ -211,6 +211,53 @@ def transcribe_audio(audio_file: str) -> str:
 
     return transcript.text.strip()
 
+def get_supabase_client():
+    try:
+        from supabase import create_client
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_SERVICE_KEY")
+        if url and key:
+            return create_client(url, key)
+    except Exception as e:
+        print(f"Supabase client error: {e}")
+    return None
+
+def get_cached_analysis(url: str):
+    try:
+        sb = get_supabase_client()
+        if not sb:
+            return None
+        result = sb.table("analyses").select("*").eq("url", url).order("created_at", desc=True).limit(1).execute()
+        if result.data:
+            cached = result.data[0]
+            print(f"Cache hit for URL: {url}")
+            return AnalyzeResponse(
+                url=cached["url"],
+                transcript=cached.get("transcript"),
+                claims=[Claim(**c) for c in cached["claims"]],
+                overall_confidence=cached["overall_confidence"],
+                status="success"
+            )
+    except Exception as e:
+        print(f"Cache lookup error: {e}")
+    return None
+
+def save_analysis_to_cache(url: str, transcript, claims: list, overall_confidence: float, platform: str):
+    try:
+        sb = get_supabase_client()
+        if not sb:
+            return
+        sb.table("analyses").insert({
+            "url": url,
+            "platform": platform,
+            "transcript": transcript,
+            "claims": [c.dict() for c in claims],
+            "overall_confidence": overall_confidence,
+        }).execute()
+        print(f"Saved analysis to cache for URL: {url}")
+    except Exception as e:
+        print(f"Cache save error: {e}")
+
 def call_perplexity(api_key: str, system_prompt: str, user_prompt: str, model: str = "sonar") -> str:
     import requests
 
@@ -227,7 +274,7 @@ def call_perplexity(api_key: str, system_prompt: str, user_prompt: str, model: s
                 {"role": "user", "content": user_prompt},
             ],
             "max_tokens": 4096,
-            "temperature": 0.1,
+            "temperature": 0,
         },
         timeout=120,
     )
@@ -256,7 +303,7 @@ def extract_claims_from_transcript(transcript: str, api_key: str) -> list[dict]:
 
 Return ONLY a valid JSON array. No markdown, no explanation, no preamble — just the raw JSON array.
 
-Extract a MAXIMUM of {MAX_CLAIMS} claims. Prioritize the most significant and checkable ones.
+Extract ALL verifiable factual claims present in the transcript without omitting any. If there are more than {MAX_CLAIMS}, extract the {MAX_CLAIMS} most specific and checkable ones. Be exhaustive — do not selectively pick claims, find every one that exists.
 
 Each item must have exactly this format:
 {{"text": "The specific claim made in the video"}}
@@ -359,6 +406,11 @@ async def analyze_article(request: Request, body: AnalyzeRequest):
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                status="error: No readable text found in that article.")
 
+    # Check cache first
+    cached = get_cached_analysis(body.url)
+    if cached:
+        return cached
+
     try:
         raw_claims = extract_claims_from_transcript(article_text, perplexity_api_key)
         claims_text = [c.get("text", "") for c in raw_claims if c.get("text")]
@@ -373,6 +425,7 @@ async def analyze_article(request: Request, body: AnalyzeRequest):
         ) for item in fact_checked]
 
         overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
+        save_analysis_to_cache(body.url, None, claims, overall_confidence, "article")
         return AnalyzeResponse(url=body.url, claims=claims, overall_confidence=overall_confidence, status="success")
 
     except Exception:
@@ -390,6 +443,11 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
     if not perplexity_api_key:
         raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
+
+    # Check cache first
+    cached = get_cached_analysis(body.url)
+    if cached:
+        return cached
 
     # Step 1: Download audio
     print("\n[Step 1] Downloading audio...")
@@ -458,6 +516,8 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
 
     print(f"\n=== Analysis complete. Claims: {len(claims)}, Confidence: {overall_confidence:.2f} ===")
+
+    save_analysis_to_cache(body.url, transcript, claims, overall_confidence, detect_platform(body.url))
 
     return AnalyzeResponse(
         url=body.url,
