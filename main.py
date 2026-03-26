@@ -261,7 +261,9 @@ Extract a MAXIMUM of {MAX_CLAIMS} claims. Prioritize the most significant and ch
 Each item must have exactly this format:
 {{"text": "The specific claim made in the video"}}
 
-Focus on: statistics, named entities, historical claims, medical/scientific claims, political claims. Skip opinions and subjective statements."""
+Focus on: statistics, named entities, historical claims, medical/scientific claims, political claims. Skip opinions and subjective statements.
+
+Reject any claim that is vague, generic, or cannot be verified with a web search. Each claim must contain at least one specific fact: a number, a name, a date, a location, or a direct assertion that can be confirmed or denied."""
 
     user_prompt = f"""Extract up to {MAX_CLAIMS} verifiable factual claims from this transcript. Return ONLY a JSON array.
 
@@ -285,6 +287,8 @@ def fact_check_claims(claims_text: list[str], api_key: str) -> list[dict]:
 
     system_prompt = """You are a professional fact-checker with access to current information.
 
+Search the web for current information before evaluating each claim. Do not rely on training data alone.
+
 For each claim, determine if it is TRUE, FALSE, MISLEADING, or UNVERIFIED.
 - TRUE: Claim is accurate and verifiable with high confidence
 - FALSE: Claim is demonstrably incorrect
@@ -306,7 +310,7 @@ Each item must have exactly this format:
   "verdict": "true" | "false" | "misleading" | "unverified",
   "confidence": 0.0-1.0,
   "explanation": "2-3 sentences explaining your verdict with specific reasoning",
-  "sources": ["Source Name — specific article or report title", "Source Name 2 — description"]
+  "sources": ["https://actual-url-of-source.com", "https://second-source-url.com"]
 }"""
 
     user_prompt = f"""Fact-check each of these claims from a social media video. Return ONLY a JSON array.
