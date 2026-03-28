@@ -20,7 +20,6 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Veracity v1", version="1.0")
 app.state.limiter = limiter
 
-# Custom rate limit response — user-friendly message
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
@@ -54,6 +53,7 @@ ALLOWED_DOMAINS = [
     "instagram.com", "instagr.am",
     "youtube.com", "youtu.be",
     "www.youtube.com", "www.tiktok.com", "www.instagram.com",
+    "x.com", "www.x.com",
 ]
 
 class AnalyzeRequest(BaseModel):
@@ -69,7 +69,7 @@ class AnalyzeRequest(BaseModel):
             domain = urlparse(v).netloc.lower().lstrip("www.")
             allowed = [d.lstrip("www.") for d in ALLOWED_DOMAINS]
             if not any(domain.endswith(d) for d in allowed):
-                raise ValueError("Only TikTok, Instagram, and YouTube URLs are supported.")
+                raise ValueError("Only TikTok, Instagram, YouTube, and X URLs are supported.")
         except ValueError:
             raise
         except Exception:
@@ -95,12 +95,12 @@ class AnalyzeResponse(BaseModel):
 MAX_CLAIMS = 9
 
 USER_FRIENDLY_ERRORS = {
-    "download": "We couldn't download that video. It may be private, deleted, or geo-restricted.",
+    "download": "We couldn't download that content. It may be private, deleted, or geo-restricted.",
     "transcription": "We couldn't transcribe the audio. The video may not have speech, or it's too short.",
-    "extraction": "We had trouble reading the claims from this video. Please try again.",
+    "extraction": "We had trouble reading the claims from this content. Please try again.",
     "factcheck": "Fact-checking hit an issue. Please try again in a moment.",
     "short": "This video doesn't appear to have enough spoken content to fact-check.",
-    "no_claims": "No verifiable factual claims were found in this video.",
+    "no_claims": "No verifiable factual claims were found in this content.",
     "config": "Server configuration error. Please contact support.",
 }
 
@@ -134,10 +134,11 @@ def detect_platform(url: str) -> str:
         return "instagram"
     elif "youtube.com" in url or "youtu.be" in url:
         return "youtube"
+    elif "x.com" in url:
+        return "x"
     return "unknown"
 
 def cleanup_audio():
-    """Remove any leftover audio files before starting a new download."""
     for f in glob.glob('/tmp/truthcore_audio.*'):
         try:
             os.remove(f)
@@ -151,7 +152,6 @@ def download_audio(url: str) -> str:
     platform = detect_platform(url)
     output_template = '/tmp/truthcore_audio.%(ext)s'
 
-    # Clean up before download to fix double-analyze bug
     cleanup_audio()
 
     ydl_opts = {
@@ -178,6 +178,9 @@ def download_audio(url: str) -> str:
         cookie_file = get_cookie_file('INSTAGRAM_COOKIES', 'instagram_cookies.txt')
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
+        ydl_opts['impersonate'] = ImpersonateTarget('chrome')
+    elif platform == "x":
+        from yt_dlp.networking.impersonate import ImpersonateTarget
         ydl_opts['impersonate'] = ImpersonateTarget('chrome')
 
     try:
@@ -211,6 +214,59 @@ def transcribe_audio(audio_file: str) -> str:
 
     return transcript.text.strip()
 
+def extract_x_content(url: str) -> tuple[str, str | None]:
+    import yt_dlp
+
+    caption = ""
+    transcript = None
+
+    meta_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+    }
+
+    try:
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        meta_opts['impersonate'] = ImpersonateTarget('chrome')
+    except Exception:
+        pass
+
+    has_video = False
+    try:
+        with yt_dlp.YoutubeDL(meta_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            caption = info.get('description') or info.get('title') or ""
+            duration = info.get('duration')
+            has_video = duration is not None and duration > 0
+            print(f"X caption extracted: {len(caption)} chars, has_video: {has_video}")
+    except Exception as e:
+        print(f"X metadata extraction error: {e}")
+
+    if has_video:
+        try:
+            audio_file = download_audio(url)
+            transcript = transcribe_audio(audio_file)
+            if os.path.exists(audio_file):
+                os.remove(audio_file)
+            print(f"X transcript extracted: {len(transcript)} chars")
+        except Exception as e:
+            print(f"X video transcription failed (non-fatal): {e}")
+            transcript = None
+
+    parts = []
+    if caption.strip():
+        parts.append(f"Post caption: {caption.strip()}")
+    if transcript and transcript.strip():
+        parts.append(f"Video speech: {transcript.strip()}")
+
+    combined = "\n\n".join(parts)
+
+    if not combined.strip():
+        raise Exception("No content could be extracted from this X post")
+
+    return combined, transcript
+
 # ====================== IN-MEMORY CACHE ======================
 _analysis_cache: dict = {}
 
@@ -229,6 +285,8 @@ def save_analysis_to_cache(url: str, transcript, claims: list, overall_confidenc
         status="success"
     )
     print(f"Saved to in-memory cache: {url}")
+
+# ====================== PERPLEXITY ======================
 
 def call_perplexity(api_key: str, system_prompt: str, user_prompt: str, model: str = "sonar") -> str:
     import requests
@@ -271,22 +329,22 @@ def extract_json_from_response(raw: str) -> list:
     return []
 
 def extract_claims_from_transcript(transcript: str, api_key: str) -> list[dict]:
-    system_prompt = f"""You are a precise claim-extraction AI. Your ONLY job is to identify specific, verifiable factual claims from a video transcript.
+    system_prompt = f"""You are a precise claim-extraction AI. Your ONLY job is to identify specific, verifiable factual claims from content.
 
 Return ONLY a valid JSON array. No markdown, no explanation, no preamble — just the raw JSON array.
 
-Extract ALL verifiable factual claims present in the transcript without omitting any. If there are more than {MAX_CLAIMS}, extract the {MAX_CLAIMS} most specific and checkable ones. Be exhaustive — do not selectively pick claims, find every one that exists.
+Extract ALL verifiable factual claims present in the content without omitting any. If there are more than {MAX_CLAIMS}, extract the {MAX_CLAIMS} most specific and checkable ones. Be exhaustive — do not selectively pick claims, find every one that exists.
 
 Each item must have exactly this format:
-{{"text": "The specific claim made in the video"}}
+{{"text": "The specific claim made in the content"}}
 
 Focus on: statistics, named entities, historical claims, medical/scientific claims, political claims. Skip opinions and subjective statements.
 
 Reject any claim that is vague, generic, or cannot be verified with a web search. Each claim must contain at least one specific fact: a number, a name, a date, a location, or a direct assertion that can be confirmed or denied."""
 
-    user_prompt = f"""Extract up to {MAX_CLAIMS} verifiable factual claims from this transcript. Return ONLY a JSON array.
+    user_prompt = f"""Extract up to {MAX_CLAIMS} verifiable factual claims from this content. Return ONLY a JSON array.
 
-Transcript:
+Content:
 {transcript}
 
 Return format: [{{"text": "claim here"}}, {{"text": "another claim"}}]"""
@@ -300,7 +358,6 @@ def fact_check_claims(claims_text: list[str], api_key: str) -> list[dict]:
     if not claims_text:
         return []
 
-    # Cap again just in case
     claims_text = claims_text[:MAX_CLAIMS]
     claims_formatted = "\n".join([f"{i+1}. {c}" for i, c in enumerate(claims_text)])
 
@@ -332,7 +389,7 @@ Each item must have exactly this format:
   "sources": ["https://actual-url-of-source.com", "https://second-source-url.com"]
 }"""
 
-    user_prompt = f"""Fact-check each of these claims from a social media video. Return ONLY a JSON array.
+    user_prompt = f"""Fact-check each of these claims. Return ONLY a JSON array.
 
 Claims to fact-check:
 {claims_formatted}"""
@@ -378,7 +435,6 @@ async def analyze_article(request: Request, body: AnalyzeRequest):
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                status="error: No readable text found in that article.")
 
-    # Check cache first
     cached = get_cached_analysis(body.url)
     if cached:
         return cached
@@ -416,12 +472,10 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     if not perplexity_api_key:
         raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
 
-    # Check cache first
     cached = get_cached_analysis(body.url)
     if cached:
         return cached
 
-    # Step 1: Download audio
     print("\n[Step 1] Downloading audio...")
     audio_file = None
     try:
@@ -432,7 +486,6 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                status=f"error: {USER_FRIENDLY_ERRORS['download']}")
 
-    # Step 2: Transcribe
     print("\n[Step 2] Transcribing audio...")
     try:
         transcript = transcribe_audio(audio_file)
@@ -452,7 +505,6 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
             status=f"error: {USER_FRIENDLY_ERRORS['short']}"
         )
 
-    # Step 3: Extract claims
     print("\n[Step 3] Extracting claims...")
     try:
         raw_claims = extract_claims_from_transcript(transcript, perplexity_api_key)
@@ -467,7 +519,6 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
         return AnalyzeResponse(url=body.url, transcript=transcript, claims=[], overall_confidence=0.0,
                                status=f"error: {USER_FRIENDLY_ERRORS['no_claims']}")
 
-    # Step 4: Fact-check
     print("\n[Step 4] Fact-checking claims...")
     try:
         fact_checked = fact_check_claims(claims_text, perplexity_api_key)
@@ -486,10 +537,89 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     ) for item in fact_checked]
 
     overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
-
     print(f"\n=== Analysis complete. Claims: {len(claims)}, Confidence: {overall_confidence:.2f} ===")
-
     save_analysis_to_cache(body.url, transcript, claims, overall_confidence, detect_platform(body.url))
+
+    return AnalyzeResponse(
+        url=body.url,
+        transcript=transcript,
+        claims=claims,
+        overall_confidence=overall_confidence,
+        status="success"
+    )
+
+# ====================== X POST ANALYSIS ======================
+
+@app.post("/analyze_x", response_model=AnalyzeResponse)
+@limiter.limit("5/minute")
+async def analyze_x_post(request: Request, body: AnalyzeRequest):
+    print(f"\n=== Starting X post analysis ===")
+
+    perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+    if not perplexity_api_key:
+        raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
+
+    cached = get_cached_analysis(body.url)
+    if cached:
+        return cached
+
+    print("\n[Step 1] Extracting X post content...")
+    try:
+        combined_text, transcript = extract_x_content(body.url)
+        print(f"Combined content length: {len(combined_text)} chars")
+    except Exception as e:
+        print(f"X extraction error: {e}")
+        return AnalyzeResponse(
+            url=body.url, claims=[], overall_confidence=0.0,
+            status=f"error: {USER_FRIENDLY_ERRORS['download']}"
+        )
+
+    if not combined_text.strip():
+        return AnalyzeResponse(
+            url=body.url, claims=[], overall_confidence=0.0,
+            status=f"error: {USER_FRIENDLY_ERRORS['no_claims']}"
+        )
+
+    print("\n[Step 2] Extracting claims...")
+    try:
+        raw_claims = extract_claims_from_transcript(combined_text, perplexity_api_key)
+        claims_text = [c.get("text", "") for c in raw_claims if c.get("text")]
+        print(f"Extracted {len(claims_text)} claims")
+    except Exception as e:
+        print(f"Claim extraction error: {e}")
+        return AnalyzeResponse(
+            url=body.url, claims=[], overall_confidence=0.0,
+            status=f"error: {USER_FRIENDLY_ERRORS['extraction']}"
+        )
+
+    if not claims_text:
+        return AnalyzeResponse(
+            url=body.url, claims=[], overall_confidence=0.0,
+            status=f"error: {USER_FRIENDLY_ERRORS['no_claims']}"
+        )
+
+    print("\n[Step 3] Fact-checking claims...")
+    try:
+        fact_checked = fact_check_claims(claims_text, perplexity_api_key)
+        print(f"Fact-checked {len(fact_checked)} claims")
+    except Exception as e:
+        print(f"Fact-check error: {e}")
+        return AnalyzeResponse(
+            url=body.url, claims=[], overall_confidence=0.0,
+            status=f"error: {USER_FRIENDLY_ERRORS['factcheck']}"
+        )
+
+    claims = [Claim(
+        text=item.get("text", ""),
+        verdict=item.get("verdict", "unverified"),
+        confidence=float(item.get("confidence", 0.5)),
+        explanation=item.get("explanation", ""),
+        sources=item.get("sources", []),
+    ) for item in fact_checked]
+
+    overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
+    print(f"\n=== X analysis complete. Claims: {len(claims)}, Confidence: {overall_confidence:.2f} ===")
+    save_analysis_to_cache(body.url, transcript, claims, overall_confidence, "x")
 
     return AnalyzeResponse(
         url=body.url,
