@@ -181,6 +181,9 @@ def download_audio(url: str) -> str:
         ydl_opts['impersonate'] = ImpersonateTarget('chrome')
     elif platform == "x":
         from yt_dlp.networking.impersonate import ImpersonateTarget
+        cookie_file = get_cookie_file('X_COOKIES', 'x_cookies.txt')
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
         ydl_opts['impersonate'] = ImpersonateTarget('chrome')
 
     try:
@@ -229,6 +232,9 @@ def extract_x_content(url: str) -> tuple[str, str | None]:
     try:
         from yt_dlp.networking.impersonate import ImpersonateTarget
         meta_opts['impersonate'] = ImpersonateTarget('chrome')
+        cookie_file = get_cookie_file('X_COOKIES', 'x_cookies.txt')
+        if cookie_file:
+            meta_opts['cookiefile'] = cookie_file
     except Exception:
         pass
 
