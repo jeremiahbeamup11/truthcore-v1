@@ -247,7 +247,24 @@ def extract_x_content(url: str) -> tuple[str, str | None]:
             has_video = duration is not None and duration > 0
             print(f"X caption extracted: {len(caption)} chars, has_video: {has_video}")
     except Exception as e:
+        error_str = str(e)
         print(f"X metadata extraction error: {e}")
+        if "No video could be found" in error_str or "no video" in error_str.lower():
+            try:
+                import requests as req
+                from bs4 import BeautifulSoup
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                }
+                resp = req.get(url, headers=headers, timeout=10)
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                og_desc = soup.find('meta', property='og:description')
+                if og_desc and og_desc.get('content'):
+                    caption = og_desc['content']
+                    print(f"X caption scraped from meta tag: {len(caption)} chars")
+            except Exception as scrape_err:
+                print(f"X scrape fallback error: {scrape_err}")
 
     if has_video:
         try:
