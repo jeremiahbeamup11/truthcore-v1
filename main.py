@@ -211,52 +211,24 @@ def transcribe_audio(audio_file: str) -> str:
 
     return transcript.text.strip()
 
-def get_supabase_client():
-    try:
-        from supabase import create_client
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_KEY")
-        if url and key:
-            return create_client(url, key)
-    except Exception as e:
-        print(f"Supabase client error: {e}")
-    return None
+# ====================== IN-MEMORY CACHE ======================
+_analysis_cache: dict = {}
 
 def get_cached_analysis(url: str):
-    try:
-        sb = get_supabase_client()
-        if not sb:
-            return None
-        result = sb.table("analyses").select("*").eq("url", url).order("created_at", desc=True).limit(1).execute()
-        if result.data:
-            cached = result.data[0]
-            print(f"Cache hit for URL: {url}")
-            return AnalyzeResponse(
-                url=cached["url"],
-                transcript=cached.get("transcript"),
-                claims=[Claim(**c) for c in cached["claims"]],
-                overall_confidence=cached["overall_confidence"],
-                status="success"
-            )
-    except Exception as e:
-        print(f"Cache lookup error: {e}")
+    if url in _analysis_cache:
+        print(f"Cache hit for URL: {url}")
+        return _analysis_cache[url]
     return None
 
 def save_analysis_to_cache(url: str, transcript, claims: list, overall_confidence: float, platform: str):
-    try:
-        sb = get_supabase_client()
-        if not sb:
-            return
-        sb.table("analyses").insert({
-            "url": url,
-            "platform": platform,
-            "transcript": transcript,
-            "claims": [c.dict() for c in claims],
-            "overall_confidence": overall_confidence,
-        }).execute()
-        print(f"Saved analysis to cache for URL: {url}")
-    except Exception as e:
-        print(f"Cache save error: {e}")
+    _analysis_cache[url] = AnalyzeResponse(
+        url=url,
+        transcript=transcript,
+        claims=claims,
+        overall_confidence=overall_confidence,
+        status="success"
+    )
+    print(f"Saved to in-memory cache: {url}")
 
 def call_perplexity(api_key: str, system_prompt: str, user_prompt: str, model: str = "sonar") -> str:
     import requests
