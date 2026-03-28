@@ -38,6 +38,7 @@ requests==2.32.5
 slowapi
 soupsieve==2.8.3
 starlette==0.50.0
+supabase
 typing_extensions==4.15.0
 ujson==5.11.0
 urllib3==2.6.3
@@ -45,6 +46,5 @@ uvicorn==0.40.0
 uvloop==0.22.1
 watchfiles==1.1.1
 websockets==16.0
-xai-sdk==1.6.1
 yarl==1.22.0
 yt-dlp==2026.2.21
