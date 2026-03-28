@@ -39,11 +39,6 @@ slowapi==0.1.9
 soupsieve==2.8.3
 starlette==0.50.0
 supabase==2.10.0
-gotrue==2.9.0
-postgrest==0.18.0
-realtime==2.0.6
-storage3==0.9.0
-supafunc==0.6.0
 typing_extensions==4.15.0
 ujson==5.11.0
 urllib3==2.6.3
