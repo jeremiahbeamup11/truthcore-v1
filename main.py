@@ -217,76 +217,111 @@ def transcribe_audio(audio_file: str) -> str:
 
     return transcript.text.strip()
 
+def get_tweet_id_from_url(url: str):
+    """Extract tweet ID from an X/Twitter URL."""
+    import re
+    match = re.search(r'(?:twitter|x)\.com/\w+/status/(\d+)', url)
+    if match:
+        return match.group(1)
+    return None
+
+def fetch_tweet_via_api(tweet_id: str):
+    """Fetch tweet data using X API v2."""
+    import requests as req
+    bearer_token = os.getenv("X_BEARER_TOKEN")
+    if not bearer_token:
+        print("X_BEARER_TOKEN not set")
+        return None
+    try:
+        response = req.get(
+            f"https://api.twitter.com/2/tweets/{tweet_id}",
+            headers={"Authorization": f"Bearer {bearer_token}"},
+            params={
+                "tweet.fields": "text,attachments,entities",
+                "expansions": "attachments.media_keys",
+                "media.fields": "type,duration_ms",
+            },
+            timeout=10,
+        )
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"X API error: {response.status_code} {response.text}")
+            return None
+    except Exception as e:
+        print(f"X API request error: {e}")
+        return None
+
 def extract_x_content(url: str) -> tuple[str, str | None]:
+    """
+    Extract caption text and optionally transcribe video from an X post.
+    Uses X API v2 for text, yt-dlp for video audio.
+    Returns (combined_text, transcript_or_none)
+    """
     import yt_dlp
 
     caption = ""
     transcript = None
-
-    meta_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-    }
-
-    try:
-        from yt_dlp.networking.impersonate import ImpersonateTarget
-        meta_opts['impersonate'] = ImpersonateTarget('chrome')
-        cookie_file = get_cookie_file('X_COOKIES', 'x_cookies.txt')
-        if cookie_file:
-            meta_opts['cookiefile'] = cookie_file
-    except Exception:
-        pass
-
     has_video = False
-    yt_dlp_success = False
-    try:
-        with yt_dlp.YoutubeDL(meta_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            caption = info.get('description') or info.get('title') or ""
-            duration = info.get('duration')
-            has_video = duration is not None and duration > 0
-            yt_dlp_success = True
-            print(f"X caption extracted: {len(caption)} chars, has_video: {has_video}")
-    except Exception as e:
-        print(f"X yt-dlp extraction error (will try scrape fallback): {e}")
 
-    # Always try scrape fallback if yt-dlp failed or returned no caption
-    if not yt_dlp_success or not caption.strip():
-        print("Attempting X scrape fallback...")
-        try:
-            import requests as req
-            from bs4 import BeautifulSoup
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept-Language': 'en-US,en;q=0.9',
-            }
-            resp = req.get(url, headers=headers, timeout=10)
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            og_desc = soup.find('meta', property='og:description')
-            if og_desc and og_desc.get('content'):
-                caption = og_desc['content']
-                print(f"X caption scraped from og:description: {len(caption)} chars")
-            else:
-                # Try twitter:description as second fallback
-                tw_desc = soup.find('meta', attrs={'name': 'twitter:description'})
-                if tw_desc and tw_desc.get('content'):
-                    caption = tw_desc['content']
-                    print(f"X caption scraped from twitter:description: {len(caption)} chars")
-        except Exception as scrape_err:
-            print(f"X scrape fallback error: {scrape_err}")
+    # Step 1: Get tweet text via X API v2
+    tweet_id = get_tweet_id_from_url(url)
+    if tweet_id:
+        print(f"Fetching tweet {tweet_id} via X API...")
+        data = fetch_tweet_via_api(tweet_id)
+        if data and "data" in data:
+            caption = data["data"].get("text", "")
+            print(f"X API caption: {len(caption)} chars")
+            if "includes" in data and "media" in data["includes"]:
+                for media in data["includes"]["media"]:
+                    if media.get("type") in ["video", "animated_gif"]:
+                        has_video = True
+                        break
+    else:
+        print("Could not extract tweet ID from URL")
 
+    # Step 2: If video exists, download and transcribe
     if has_video:
+        print("Video detected, attempting transcription...")
         try:
-            audio_file = download_audio(url)
-            transcript = transcribe_audio(audio_file)
-            if os.path.exists(audio_file):
+            ydl_opts = {
+                "format": "bestaudio/best",
+                "outtmpl": "/tmp/truthcore_audio.%(ext)s",
+                "quiet": True,
+                "no_warnings": True,
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "128",
+                }],
+            }
+            try:
+                from yt_dlp.networking.impersonate import ImpersonateTarget
+                ydl_opts["impersonate"] = ImpersonateTarget("chrome")
+                cookie_file = get_cookie_file("X_COOKIES", "x_cookies.txt")
+                if cookie_file:
+                    ydl_opts["cookiefile"] = cookie_file
+            except Exception:
+                pass
+
+            cleanup_audio()
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+            audio_file = "/tmp/truthcore_audio.mp3"
+            if not os.path.exists(audio_file):
+                files = glob.glob("/tmp/truthcore_audio.*")
+                audio_file = files[0] if files else None
+
+            if audio_file and os.path.getsize(audio_file) > 0:
+                transcript = transcribe_audio(audio_file)
                 os.remove(audio_file)
-            print(f"X transcript extracted: {len(transcript)} chars")
+                print(f"X transcript extracted: {len(transcript)} chars")
         except Exception as e:
             print(f"X video transcription failed (non-fatal): {e}")
             transcript = None
 
+    # Step 3: Combine caption and transcript
     parts = []
     if caption.strip():
         parts.append(f"Post caption: {caption.strip()}")
@@ -299,6 +334,7 @@ def extract_x_content(url: str) -> tuple[str, str | None]:
         raise Exception("No content could be extracted from this X post")
 
     return combined, transcript
+
 
 # ====================== IN-MEMORY CACHE ======================
 _analysis_cache: dict = {}
