@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -11,8 +11,11 @@ import os
 import json
 import glob
 import re
+import stripe
 
 load_dotenv()
+
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 # ====================== RATE LIMITER ======================
 
@@ -56,8 +59,14 @@ ALLOWED_DOMAINS = [
     "x.com", "www.x.com",
 ]
 
+FREE_MAX_CLAIMS = 5
+PRO_MAX_CLAIMS = 15
+FREE_MONTHLY_LIMIT = 10
+PRO_MONTHLY_LIMIT = 100
+
 class AnalyzeRequest(BaseModel):
     url: str
+    user_id: Optional[str] = None
 
     @validator("url")
     def validate_url(cls, v):
@@ -76,6 +85,11 @@ class AnalyzeRequest(BaseModel):
             raise ValueError("Invalid URL format")
         return v
 
+class CheckoutRequest(BaseModel):
+    user_id: str
+    email: str
+    plan: str  # "monthly" or "annual"
+
 class Claim(BaseModel):
     text: str
     verdict: str
@@ -89,10 +103,9 @@ class AnalyzeResponse(BaseModel):
     claims: List[Claim]
     overall_confidence: float
     status: str
+    plan: Optional[str] = "free"
 
 # ====================== HELPERS ======================
-
-MAX_CLAIMS = 9
 
 USER_FRIENDLY_ERRORS = {
     "download": "We couldn't download that content. It may be private, deleted, or geo-restricted.",
@@ -102,7 +115,110 @@ USER_FRIENDLY_ERRORS = {
     "short": "This video doesn't appear to have enough spoken content to fact-check.",
     "no_claims": "No verifiable factual claims were found in this content.",
     "config": "Server configuration error. Please contact support.",
+    "limit": "You've reached your monthly analysis limit. Upgrade to Pro for 100 analyses per month.",
 }
+
+def get_supabase_client():
+    try:
+        from supabase import create_client
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_SERVICE_KEY")
+        if url and key:
+            return create_client(url, key)
+    except Exception as e:
+        print(f"Supabase client error: {e}")
+    return None
+
+def get_user_plan(user_id: str) -> str:
+    """Returns 'pro' or 'free' for a given user."""
+    if not user_id:
+        return "free"
+    try:
+        sb = get_supabase_client()
+        if not sb:
+            return "free"
+        from datetime import datetime, timezone
+        result = sb.table("subscriptions").select("plan,status,current_period_end,trial_end").eq("user_id", user_id).limit(1).execute()
+        if result.data:
+            sub = result.data[0]
+            plan = sub.get("plan", "free")
+            status = sub.get("status", "inactive")
+            period_end = sub.get("current_period_end")
+            trial_end = sub.get("trial_end")
+            now = datetime.now(timezone.utc).isoformat()
+            # Check if trial is active
+            if trial_end and trial_end > now:
+                return "pro"
+            # Check if subscription is active
+            if plan == "pro" and status == "active" and period_end and period_end > now:
+                return "pro"
+        return "free"
+    except Exception as e:
+        print(f"get_user_plan error: {e}")
+        return "free"
+
+def check_and_increment_usage(user_id: str, plan: str) -> bool:
+    """
+    Returns True if user is allowed to analyze, False if limit reached.
+    Increments usage counter.
+    """
+    if not user_id:
+        return True  # unauthenticated users handled by rate limiter
+
+    limit = PRO_MONTHLY_LIMIT if plan == "pro" else FREE_MONTHLY_LIMIT
+
+    try:
+        sb = get_supabase_client()
+        if not sb:
+            return True  # fail open if supabase unavailable
+
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+
+        result = sb.table("usage").select("*").eq("user_id", user_id).limit(1).execute()
+
+        if not result.data:
+            # First analysis — create usage record
+            sb.table("usage").insert({
+                "user_id": user_id,
+                "analyses_this_month": 1,
+                "reset_date": (now.replace(day=1) + __import__('dateutil.relativedelta', fromlist=['relativedelta']).relativedelta(months=1)).isoformat() if False else _next_month(now),
+            }).execute()
+            return True
+
+        usage = result.data[0]
+        reset_date = usage.get("reset_date")
+        count = usage.get("analyses_this_month", 0)
+
+        # Check if we need to reset the counter
+        if reset_date and now.isoformat() > reset_date:
+            sb.table("usage").update({
+                "analyses_this_month": 1,
+                "reset_date": _next_month(now),
+            }).eq("user_id", user_id).execute()
+            return True
+
+        if count >= limit:
+            return False
+
+        # Increment counter
+        sb.table("usage").update({
+            "analyses_this_month": count + 1,
+        }).eq("user_id", user_id).execute()
+        return True
+
+    except Exception as e:
+        print(f"check_and_increment_usage error: {e}")
+        return True  # fail open
+
+def _next_month(dt) -> str:
+    from datetime import timezone
+    import calendar
+    year = dt.year + (1 if dt.month == 12 else 0)
+    month = 1 if dt.month == 12 else dt.month + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    from datetime import datetime
+    return datetime(year, month, day, tzinfo=timezone.utc).isoformat()
 
 def get_cookie_file(env_var: str, filename: str) -> str | None:
     import base64
@@ -218,19 +334,15 @@ def transcribe_audio(audio_file: str) -> str:
     return transcript.text.strip()
 
 def get_tweet_id_from_url(url: str):
-    """Extract tweet ID from an X/Twitter URL."""
-    import re
     match = re.search(r'(?:twitter|x)\.com/\w+/status/(\d+)', url)
     if match:
         return match.group(1)
     return None
 
 def fetch_tweet_via_api(tweet_id: str):
-    """Fetch tweet data using X API v2."""
     import requests as req
     bearer_token = os.getenv("X_BEARER_TOKEN")
     if not bearer_token:
-        print("X_BEARER_TOKEN not set")
         return None
     try:
         response = req.get(
@@ -245,55 +357,37 @@ def fetch_tweet_via_api(tweet_id: str):
         )
         if response.status_code == 200:
             return response.json()
-        else:
-            print(f"X API error: {response.status_code} {response.text}")
-            return None
+        return None
     except Exception as e:
         print(f"X API request error: {e}")
         return None
 
 def extract_x_content(url: str) -> tuple[str, str | None]:
-    """
-    Extract caption text and optionally transcribe video from an X post.
-    Uses X API v2 for text, yt-dlp for video audio.
-    Returns (combined_text, transcript_or_none)
-    """
     import yt_dlp
 
     caption = ""
     transcript = None
     has_video = False
 
-    # Step 1: Get tweet text via X API v2
     tweet_id = get_tweet_id_from_url(url)
     if tweet_id:
-        print(f"Fetching tweet {tweet_id} via X API...")
         data = fetch_tweet_via_api(tweet_id)
         if data and "data" in data:
             caption = data["data"].get("text", "")
-            print(f"X API caption: {len(caption)} chars")
             if "includes" in data and "media" in data["includes"]:
                 for media in data["includes"]["media"]:
                     if media.get("type") in ["video", "animated_gif"]:
                         has_video = True
                         break
-    else:
-        print("Could not extract tweet ID from URL")
 
-    # Step 2: If video exists, download and transcribe
     if has_video:
-        print("Video detected, attempting transcription...")
         try:
             ydl_opts = {
                 "format": "bestaudio/best",
                 "outtmpl": "/tmp/truthcore_audio.%(ext)s",
                 "quiet": True,
                 "no_warnings": True,
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "128",
-                }],
+                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
             }
             try:
                 from yt_dlp.networking.impersonate import ImpersonateTarget
@@ -316,12 +410,10 @@ def extract_x_content(url: str) -> tuple[str, str | None]:
             if audio_file and os.path.getsize(audio_file) > 0:
                 transcript = transcribe_audio(audio_file)
                 os.remove(audio_file)
-                print(f"X transcript extracted: {len(transcript)} chars")
         except Exception as e:
             print(f"X video transcription failed (non-fatal): {e}")
             transcript = None
 
-    # Step 3: Combine caption and transcript
     parts = []
     if caption.strip():
         parts.append(f"Post caption: {caption.strip()}")
@@ -335,7 +427,6 @@ def extract_x_content(url: str) -> tuple[str, str | None]:
 
     return combined, transcript
 
-
 # ====================== IN-MEMORY CACHE ======================
 _analysis_cache: dict = {}
 
@@ -345,13 +436,14 @@ def get_cached_analysis(url: str):
         return _analysis_cache[url]
     return None
 
-def save_analysis_to_cache(url: str, transcript, claims: list, overall_confidence: float, platform: str):
+def save_analysis_to_cache(url: str, transcript, claims: list, overall_confidence: float, platform: str, plan: str = "free"):
     _analysis_cache[url] = AnalyzeResponse(
         url=url,
         transcript=transcript,
         claims=claims,
         overall_confidence=overall_confidence,
-        status="success"
+        status="success",
+        plan=plan,
     )
     print(f"Saved to in-memory cache: {url}")
 
@@ -397,12 +489,12 @@ def extract_json_from_response(raw: str) -> list:
         pass
     return []
 
-def extract_claims_from_transcript(transcript: str, api_key: str) -> list[dict]:
+def extract_claims_from_transcript(transcript: str, api_key: str, max_claims: int = 9) -> list[dict]:
     system_prompt = f"""You are a precise claim-extraction AI. Your ONLY job is to identify specific, verifiable factual claims from content.
 
 Return ONLY a valid JSON array. No markdown, no explanation, no preamble — just the raw JSON array.
 
-Extract ALL verifiable factual claims present in the content without omitting any. If there are more than {MAX_CLAIMS}, extract the {MAX_CLAIMS} most specific and checkable ones. Be exhaustive — do not selectively pick claims, find every one that exists.
+Extract ALL verifiable factual claims present in the content without omitting any. If there are more than {max_claims}, extract the {max_claims} most specific and checkable ones. Be exhaustive — do not selectively pick claims, find every one that exists.
 
 Each item must have exactly this format:
 {{"text": "The specific claim made in the content"}}
@@ -411,7 +503,7 @@ Focus on: statistics, named entities, historical claims, medical/scientific clai
 
 Reject any claim that is vague, generic, or cannot be verified with a web search. Each claim must contain at least one specific fact: a number, a name, a date, a location, or a direct assertion that can be confirmed or denied."""
 
-    user_prompt = f"""Extract up to {MAX_CLAIMS} verifiable factual claims from this content. Return ONLY a JSON array.
+    user_prompt = f"""Extract up to {max_claims} verifiable factual claims from this content. Return ONLY a JSON array.
 
 Content:
 {transcript}
@@ -421,13 +513,12 @@ Return format: [{{"text": "claim here"}}, {{"text": "another claim"}}]"""
     raw = call_perplexity(api_key, system_prompt, user_prompt)
     print("Raw claims extraction response:", repr(raw[:200]))
     claims = extract_json_from_response(raw)
-    return claims[:MAX_CLAIMS]
+    return claims[:max_claims]
 
-def fact_check_claims(claims_text: list[str], api_key: str) -> list[dict]:
+def fact_check_claims(claims_text: list[str], api_key: str, model: str = "sonar") -> list[dict]:
     if not claims_text:
         return []
 
-    claims_text = claims_text[:MAX_CLAIMS]
     claims_formatted = "\n".join([f"{i+1}. {c}" for i, c in enumerate(claims_text)])
 
     system_prompt = """You are a professional fact-checker with access to current information.
@@ -463,9 +554,30 @@ Each item must have exactly this format:
 Claims to fact-check:
 {claims_formatted}"""
 
-    raw = call_perplexity(api_key, system_prompt, user_prompt)
+    raw = call_perplexity(api_key, system_prompt, user_prompt, model=model)
     print("Raw fact-check response:", repr(raw[:300]))
     return extract_json_from_response(raw)
+
+def run_analysis(content: str, api_key: str, plan: str) -> list[Claim]:
+    """Run full analysis pipeline with plan-aware limits and model selection."""
+    max_claims = PRO_MAX_CLAIMS if plan == "pro" else FREE_MAX_CLAIMS
+    model = "sonar-pro" if plan == "pro" else "sonar"
+
+    raw_claims = extract_claims_from_transcript(content, api_key, max_claims=max_claims)
+    claims_text = [c.get("text", "") for c in raw_claims if c.get("text")]
+
+    if not claims_text:
+        return []
+
+    fact_checked = fact_check_claims(claims_text, api_key, model=model)
+
+    return [Claim(
+        text=item.get("text", ""),
+        verdict=item.get("verdict", "unverified"),
+        confidence=float(item.get("confidence", 0.5)),
+        explanation=item.get("explanation", ""),
+        sources=item.get("sources", []),
+    ) for item in fact_checked]
 
 # ====================== ROUTES ======================
 
@@ -477,6 +589,133 @@ def read_root():
 def health_check():
     return {"status": "ok"}
 
+@app.get("/user/plan")
+async def get_plan(user_id: str):
+    plan = get_user_plan(user_id)
+    return {"plan": plan}
+
+# ====================== STRIPE CHECKOUT ======================
+
+@app.post("/create-checkout-session")
+async def create_checkout_session(body: CheckoutRequest):
+    try:
+        price_id = (
+            os.getenv("STRIPE_MONTHLY_PRICE_ID")
+            if body.plan == "monthly"
+            else os.getenv("STRIPE_YEARLY_PRICE_ID")
+        )
+
+        if not price_id:
+            raise HTTPException(status_code=500, detail="Stripe price not configured")
+
+        # Check if customer already exists
+        sb = get_supabase_client()
+        stripe_customer_id = None
+        if sb:
+            result = sb.table("subscriptions").select("stripe_customer_id").eq("user_id", body.user_id).limit(1).execute()
+            if result.data and result.data[0].get("stripe_customer_id"):
+                stripe_customer_id = result.data[0]["stripe_customer_id"]
+
+        # Create or reuse Stripe customer
+        if not stripe_customer_id:
+            customer = stripe.Customer.create(
+                email=body.email,
+                metadata={"user_id": body.user_id}
+            )
+            stripe_customer_id = customer.id
+
+        # Determine trial days — first 200 users get 14-day trial
+        trial_days = None
+        if sb:
+            count_result = sb.table("subscriptions").select("id", count="exact").execute()
+            if count_result.count is not None and count_result.count < 200:
+                trial_days = 14
+
+        session_params = {
+            "customer": stripe_customer_id,
+            "payment_method_types": ["card"],
+            "line_items": [{"price": price_id, "quantity": 1}],
+            "mode": "subscription",
+            "success_url": "https://truthcore.ai/success?session_id={CHECKOUT_SESSION_ID}",
+            "cancel_url": "https://truthcore.ai/pricing",
+            "metadata": {"user_id": body.user_id},
+        }
+
+        if trial_days:
+            session_params["subscription_data"] = {"trial_period_days": trial_days}
+
+        session = stripe.checkout.Session.create(**session_params)
+        return {"url": session.url}
+
+    except stripe.StripeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ====================== STRIPE WEBHOOK ======================
+
+@app.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+    try:
+        if webhook_secret:
+            event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+        else:
+            event = json.loads(payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    sb = get_supabase_client()
+    if not sb:
+        return {"status": "ok"}
+
+    event_type = event["type"]
+    print(f"Stripe webhook: {event_type}")
+
+    if event_type in ["customer.subscription.created", "customer.subscription.updated"]:
+        sub = event["data"]["object"]
+        customer_id = sub["customer"]
+        status = sub["status"]
+        plan = "pro" if status in ["active", "trialing"] else "free"
+        period_end = sub.get("current_period_end")
+        trial_end = sub.get("trial_end")
+
+        from datetime import datetime, timezone
+        period_end_iso = datetime.fromtimestamp(period_end, tz=timezone.utc).isoformat() if period_end else None
+        trial_end_iso = datetime.fromtimestamp(trial_end, tz=timezone.utc).isoformat() if trial_end else None
+
+        # Get user_id from customer metadata
+        customer = stripe.Customer.retrieve(customer_id)
+        user_id = customer.get("metadata", {}).get("user_id")
+
+        if user_id:
+            sb.table("subscriptions").upsert({
+                "user_id": user_id,
+                "stripe_customer_id": customer_id,
+                "stripe_subscription_id": sub["id"],
+                "plan": plan,
+                "status": status,
+                "current_period_end": period_end_iso,
+                "trial_end": trial_end_iso,
+            }, on_conflict="user_id").execute()
+            print(f"Updated subscription for user {user_id}: {plan}")
+
+    elif event_type == "customer.subscription.deleted":
+        sub = event["data"]["object"]
+        customer_id = sub["customer"]
+        customer = stripe.Customer.retrieve(customer_id)
+        user_id = customer.get("metadata", {}).get("user_id")
+
+        if user_id:
+            sb.table("subscriptions").update({
+                "plan": "free",
+                "status": "canceled",
+            }).eq("user_id", user_id).execute()
+            print(f"Canceled subscription for user {user_id}")
+
+    return {"status": "ok"}
+
 # ====================== TEXT ARTICLE ANALYSIS ======================
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -485,6 +724,14 @@ async def analyze_article(request: Request, body: AnalyzeRequest):
     perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
     if not perplexity_api_key:
         raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
+
+    plan = get_user_plan(body.user_id) if body.user_id else "free"
+
+    if body.user_id:
+        allowed = check_and_increment_usage(body.user_id, plan)
+        if not allowed:
+            return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
+                                   status=f"error: {USER_FRIENDLY_ERRORS['limit']}", plan=plan)
 
     import requests as req
     from bs4 import BeautifulSoup
@@ -498,36 +745,24 @@ async def analyze_article(request: Request, body: AnalyzeRequest):
         article_text = ' '.join([p.text for p in soup.find_all('p')])[:5000]
     except Exception:
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
-                               status="error: We couldn't fetch that article. It may be behind a paywall or unavailable.")
+                               status="error: We couldn't fetch that article. It may be behind a paywall or unavailable.", plan=plan)
 
     if not article_text.strip():
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
-                               status="error: No readable text found in that article.")
+                               status="error: No readable text found in that article.", plan=plan)
 
     cached = get_cached_analysis(body.url)
     if cached:
         return cached
 
     try:
-        raw_claims = extract_claims_from_transcript(article_text, perplexity_api_key)
-        claims_text = [c.get("text", "") for c in raw_claims if c.get("text")]
-        fact_checked = fact_check_claims(claims_text, perplexity_api_key)
-
-        claims = [Claim(
-            text=item.get("text", ""),
-            verdict=item.get("verdict", "unverified"),
-            confidence=float(item.get("confidence", 0.5)),
-            explanation=item.get("explanation", ""),
-            sources=item.get("sources", []),
-        ) for item in fact_checked]
-
+        claims = run_analysis(article_text, perplexity_api_key, plan)
         overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
-        save_analysis_to_cache(body.url, None, claims, overall_confidence, "article")
-        return AnalyzeResponse(url=body.url, claims=claims, overall_confidence=overall_confidence, status="success")
-
+        save_analysis_to_cache(body.url, None, claims, overall_confidence, "article", plan)
+        return AnalyzeResponse(url=body.url, claims=claims, overall_confidence=overall_confidence, status="success", plan=plan)
     except Exception:
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
-                               status="error: Something went wrong during analysis. Please try again.")
+                               status="error: Something went wrong during analysis. Please try again.", plan=plan)
 
 # ====================== VIDEO ANALYSIS ======================
 
@@ -541,6 +776,14 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     if not perplexity_api_key:
         raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
 
+    plan = get_user_plan(body.user_id) if body.user_id else "free"
+
+    if body.user_id:
+        allowed = check_and_increment_usage(body.user_id, plan)
+        if not allowed:
+            return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
+                                   status=f"error: {USER_FRIENDLY_ERRORS['limit']}", plan=plan)
+
     cached = get_cached_analysis(body.url)
     if cached:
         return cached
@@ -553,7 +796,7 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     except Exception as e:
         print(f"Download error: {e}")
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
-                               status=f"error: {USER_FRIENDLY_ERRORS['download']}")
+                               status=f"error: {USER_FRIENDLY_ERRORS['download']}", plan=plan)
 
     print("\n[Step 2] Transcribing audio...")
     try:
@@ -562,60 +805,27 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     except Exception as e:
         print(f"Transcription error: {e}")
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
-                               status=f"error: {USER_FRIENDLY_ERRORS['transcription']}")
+                               status=f"error: {USER_FRIENDLY_ERRORS['transcription']}", plan=plan)
     finally:
         if audio_file and os.path.exists(audio_file):
             os.remove(audio_file)
 
     if not transcript or len(transcript) < 10:
-        return AnalyzeResponse(
-            url=body.url, transcript=transcript, claims=[],
-            overall_confidence=0.0,
-            status=f"error: {USER_FRIENDLY_ERRORS['short']}"
-        )
+        return AnalyzeResponse(url=body.url, transcript=transcript, claims=[],
+                               overall_confidence=0.0, status=f"error: {USER_FRIENDLY_ERRORS['short']}", plan=plan)
 
-    print("\n[Step 3] Extracting claims...")
+    print("\n[Step 3] Running analysis...")
     try:
-        raw_claims = extract_claims_from_transcript(transcript, perplexity_api_key)
-        claims_text = [c.get("text", "") for c in raw_claims if c.get("text")]
-        print(f"Extracted {len(claims_text)} claims")
+        claims = run_analysis(transcript, perplexity_api_key, plan)
+        overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
+        print(f"\n=== Analysis complete. Claims: {len(claims)}, Confidence: {overall_confidence:.2f}, Plan: {plan} ===")
+        save_analysis_to_cache(body.url, transcript, claims, overall_confidence, detect_platform(body.url), plan)
+        return AnalyzeResponse(url=body.url, transcript=transcript, claims=claims,
+                               overall_confidence=overall_confidence, status="success", plan=plan)
     except Exception as e:
-        print(f"Claim extraction error: {e}")
+        print(f"Analysis error: {e}")
         return AnalyzeResponse(url=body.url, transcript=transcript, claims=[], overall_confidence=0.0,
-                               status=f"error: {USER_FRIENDLY_ERRORS['extraction']}")
-
-    if not claims_text:
-        return AnalyzeResponse(url=body.url, transcript=transcript, claims=[], overall_confidence=0.0,
-                               status=f"error: {USER_FRIENDLY_ERRORS['no_claims']}")
-
-    print("\n[Step 4] Fact-checking claims...")
-    try:
-        fact_checked = fact_check_claims(claims_text, perplexity_api_key)
-        print(f"Fact-checked {len(fact_checked)} claims")
-    except Exception as e:
-        print(f"Fact-check error: {e}")
-        return AnalyzeResponse(url=body.url, transcript=transcript, claims=[], overall_confidence=0.0,
-                               status=f"error: {USER_FRIENDLY_ERRORS['factcheck']}")
-
-    claims = [Claim(
-        text=item.get("text", ""),
-        verdict=item.get("verdict", "unverified"),
-        confidence=float(item.get("confidence", 0.5)),
-        explanation=item.get("explanation", ""),
-        sources=item.get("sources", []),
-    ) for item in fact_checked]
-
-    overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
-    print(f"\n=== Analysis complete. Claims: {len(claims)}, Confidence: {overall_confidence:.2f} ===")
-    save_analysis_to_cache(body.url, transcript, claims, overall_confidence, detect_platform(body.url))
-
-    return AnalyzeResponse(
-        url=body.url,
-        transcript=transcript,
-        claims=claims,
-        overall_confidence=overall_confidence,
-        status="success"
-    )
+                               status=f"error: {USER_FRIENDLY_ERRORS['factcheck']}", plan=plan)
 
 # ====================== X POST ANALYSIS ======================
 
@@ -628,6 +838,14 @@ async def analyze_x_post(request: Request, body: AnalyzeRequest):
     if not perplexity_api_key:
         raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
 
+    plan = get_user_plan(body.user_id) if body.user_id else "free"
+
+    if body.user_id:
+        allowed = check_and_increment_usage(body.user_id, plan)
+        if not allowed:
+            return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
+                                   status=f"error: {USER_FRIENDLY_ERRORS['limit']}", plan=plan)
+
     cached = get_cached_analysis(body.url)
     if cached:
         return cached
@@ -638,62 +856,22 @@ async def analyze_x_post(request: Request, body: AnalyzeRequest):
         print(f"Combined content length: {len(combined_text)} chars")
     except Exception as e:
         print(f"X extraction error: {e}")
-        return AnalyzeResponse(
-            url=body.url, claims=[], overall_confidence=0.0,
-            status=f"error: {USER_FRIENDLY_ERRORS['download']}"
-        )
+        return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
+                               status=f"error: {USER_FRIENDLY_ERRORS['download']}", plan=plan)
 
     if not combined_text.strip():
-        return AnalyzeResponse(
-            url=body.url, claims=[], overall_confidence=0.0,
-            status=f"error: {USER_FRIENDLY_ERRORS['no_claims']}"
-        )
+        return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
+                               status=f"error: {USER_FRIENDLY_ERRORS['no_claims']}", plan=plan)
 
-    print("\n[Step 2] Extracting claims...")
+    print("\n[Step 2] Running analysis...")
     try:
-        raw_claims = extract_claims_from_transcript(combined_text, perplexity_api_key)
-        claims_text = [c.get("text", "") for c in raw_claims if c.get("text")]
-        print(f"Extracted {len(claims_text)} claims")
+        claims = run_analysis(combined_text, perplexity_api_key, plan)
+        overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
+        print(f"\n=== X analysis complete. Claims: {len(claims)}, Confidence: {overall_confidence:.2f}, Plan: {plan} ===")
+        save_analysis_to_cache(body.url, transcript, claims, overall_confidence, "x", plan)
+        return AnalyzeResponse(url=body.url, transcript=transcript, claims=claims,
+                               overall_confidence=overall_confidence, status="success", plan=plan)
     except Exception as e:
-        print(f"Claim extraction error: {e}")
-        return AnalyzeResponse(
-            url=body.url, claims=[], overall_confidence=0.0,
-            status=f"error: {USER_FRIENDLY_ERRORS['extraction']}"
-        )
-
-    if not claims_text:
-        return AnalyzeResponse(
-            url=body.url, claims=[], overall_confidence=0.0,
-            status=f"error: {USER_FRIENDLY_ERRORS['no_claims']}"
-        )
-
-    print("\n[Step 3] Fact-checking claims...")
-    try:
-        fact_checked = fact_check_claims(claims_text, perplexity_api_key)
-        print(f"Fact-checked {len(fact_checked)} claims")
-    except Exception as e:
-        print(f"Fact-check error: {e}")
-        return AnalyzeResponse(
-            url=body.url, claims=[], overall_confidence=0.0,
-            status=f"error: {USER_FRIENDLY_ERRORS['factcheck']}"
-        )
-
-    claims = [Claim(
-        text=item.get("text", ""),
-        verdict=item.get("verdict", "unverified"),
-        confidence=float(item.get("confidence", 0.5)),
-        explanation=item.get("explanation", ""),
-        sources=item.get("sources", []),
-    ) for item in fact_checked]
-
-    overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
-    print(f"\n=== X analysis complete. Claims: {len(claims)}, Confidence: {overall_confidence:.2f} ===")
-    save_analysis_to_cache(body.url, transcript, claims, overall_confidence, "x")
-
-    return AnalyzeResponse(
-        url=body.url,
-        transcript=transcript,
-        claims=claims,
-        overall_confidence=overall_confidence,
-        status="success"
-    )
+        print(f"Analysis error: {e}")
+        return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
+                               status=f"error: {USER_FRIENDLY_ERRORS['factcheck']}", plan=plan)
