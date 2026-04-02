@@ -118,38 +118,58 @@ USER_FRIENDLY_ERRORS = {
     "limit": "You've reached your monthly analysis limit. Upgrade to Pro for 100 analyses per month.",
 }
 
-def get_supabase_client():
+def supabase_request(method: str, table: str, data: dict = None, params: dict = None):
+    """Make a direct REST call to Supabase — no supabase package needed."""
+    import requests as req
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        print("Supabase env vars missing")
+        return None
     try:
-        from supabase import create_client
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_KEY")
-        if url and key:
-            return create_client(url, key)
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+        endpoint = f"{url}/rest/v1/{table}"
+        if method == "GET":
+            resp = req.get(endpoint, headers=headers, params=params, timeout=5)
+        elif method == "POST":
+            resp = req.post(endpoint, headers=headers, json=data, timeout=5)
+        elif method == "PATCH":
+            resp = req.patch(endpoint, headers=headers, json=data, params=params, timeout=5)
+        else:
+            return None
+        if resp.status_code in [200, 201]:
+            return resp.json()
+        print(f"Supabase error {resp.status_code}: {resp.text}")
+        return None
     except Exception as e:
-        print(f"Supabase client error: {e}")
-    return None
+        print(f"Supabase request error: {e}")
+        return None
 
 def get_user_plan(user_id: str) -> str:
     """Returns 'pro' or 'free' for a given user."""
     if not user_id:
         return "free"
     try:
-        sb = get_supabase_client()
-        if not sb:
-            return "free"
         from datetime import datetime, timezone
-        result = sb.table("subscriptions").select("plan,status,current_period_end,trial_end").eq("user_id", user_id).limit(1).execute()
-        if result.data:
-            sub = result.data[0]
+        result = supabase_request("GET", "subscriptions", params={
+            "select": "plan,status,current_period_end,trial_end",
+            "user_id": f"eq.{user_id}",
+            "limit": "1",
+        })
+        if result and len(result) > 0:
+            sub = result[0]
             plan = sub.get("plan", "free")
             status = sub.get("status", "inactive")
             period_end = sub.get("current_period_end")
             trial_end = sub.get("trial_end")
             now = datetime.now(timezone.utc).isoformat()
-            # Check if trial is active
             if trial_end and trial_end > now:
                 return "pro"
-            # Check if subscription is active
             if plan == "pro" and status == "active" and period_end and period_end > now:
                 return "pro"
         return "free"
@@ -158,53 +178,53 @@ def get_user_plan(user_id: str) -> str:
         return "free"
 
 def check_and_increment_usage(user_id: str, plan: str) -> bool:
-    """
-    Returns True if user is allowed to analyze, False if limit reached.
-    Increments usage counter.
-    """
+    """Returns True if user is allowed to analyze, False if limit reached."""
     if not user_id:
-        return True  # unauthenticated users handled by rate limiter
+        return True
 
     limit = PRO_MONTHLY_LIMIT if plan == "pro" else FREE_MONTHLY_LIMIT
 
     try:
-        sb = get_supabase_client()
-        if not sb:
-            return True  # fail open if supabase unavailable
-
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
 
-        result = sb.table("usage").select("*").eq("user_id", user_id).limit(1).execute()
+        result = supabase_request("GET", "usage", params={
+            "select": "*",
+            "user_id": f"eq.{user_id}",
+            "limit": "1",
+        })
 
-        if not result.data:
+        if not result or len(result) == 0:
             # First analysis — create usage record
-            sb.table("usage").insert({
+            supabase_request("POST", "usage", data={
                 "user_id": user_id,
                 "analyses_this_month": 1,
-                "reset_date": (now.replace(day=1) + __import__('dateutil.relativedelta', fromlist=['relativedelta']).relativedelta(months=1)).isoformat() if False else _next_month(now),
-            }).execute()
+                "reset_date": _next_month(now),
+            })
+            print(f"Created usage record for {user_id}")
             return True
 
-        usage = result.data[0]
+        usage = result[0]
         reset_date = usage.get("reset_date")
         count = usage.get("analyses_this_month", 0)
 
-        # Check if we need to reset the counter
+        # Reset counter if month has passed
         if reset_date and now.isoformat() > reset_date:
-            sb.table("usage").update({
+            supabase_request("PATCH", "usage", data={
                 "analyses_this_month": 1,
                 "reset_date": _next_month(now),
-            }).eq("user_id", user_id).execute()
+            }, params={"user_id": f"eq.{user_id}"})
             return True
 
         if count >= limit:
+            print(f"User {user_id} hit limit: {count}/{limit}")
             return False
 
         # Increment counter
-        sb.table("usage").update({
+        supabase_request("PATCH", "usage", data={
             "analyses_this_month": count + 1,
-        }).eq("user_id", user_id).execute()
+        }, params={"user_id": f"eq.{user_id}"})
+        print(f"Usage incremented for {user_id}: {count + 1}/{limit}")
         return True
 
     except Exception as e:
@@ -609,12 +629,14 @@ async def create_checkout_session(body: CheckoutRequest):
             raise HTTPException(status_code=500, detail="Stripe price not configured")
 
         # Check if customer already exists
-        sb = get_supabase_client()
         stripe_customer_id = None
-        if sb:
-            result = sb.table("subscriptions").select("stripe_customer_id").eq("user_id", body.user_id).limit(1).execute()
-            if result.data and result.data[0].get("stripe_customer_id"):
-                stripe_customer_id = result.data[0]["stripe_customer_id"]
+        result = supabase_request("GET", "subscriptions", params={
+            "select": "stripe_customer_id",
+            "user_id": f"eq.{body.user_id}",
+            "limit": "1",
+        })
+        if result and len(result) > 0 and result[0].get("stripe_customer_id"):
+            stripe_customer_id = result[0]["stripe_customer_id"]
 
         # Create or reuse Stripe customer
         if not stripe_customer_id:
@@ -626,10 +648,11 @@ async def create_checkout_session(body: CheckoutRequest):
 
         # Determine trial days — first 200 users get 14-day trial
         trial_days = None
-        if sb:
-            count_result = sb.table("subscriptions").select("id", count="exact").execute()
-            if count_result.count is not None and count_result.count < 200:
-                trial_days = 14
+        count_result = supabase_request("GET", "subscriptions", params={
+            "select": "id", "limit": "1000"
+        })
+        if count_result is not None and len(count_result) < 200:
+            trial_days = 14
 
         session_params = {
             "customer": stripe_customer_id,
@@ -666,10 +689,6 @@ async def stripe_webhook(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    sb = get_supabase_client()
-    if not sb:
-        return {"status": "ok"}
-
     event_type = event["type"]
     print(f"Stripe webhook: {event_type}")
 
@@ -685,20 +704,33 @@ async def stripe_webhook(request: Request):
         period_end_iso = datetime.fromtimestamp(period_end, tz=timezone.utc).isoformat() if period_end else None
         trial_end_iso = datetime.fromtimestamp(trial_end, tz=timezone.utc).isoformat() if trial_end else None
 
-        # Get user_id from customer metadata
         customer = stripe.Customer.retrieve(customer_id)
         user_id = customer.get("metadata", {}).get("user_id")
 
         if user_id:
-            sb.table("subscriptions").upsert({
-                "user_id": user_id,
-                "stripe_customer_id": customer_id,
-                "stripe_subscription_id": sub["id"],
-                "plan": plan,
-                "status": status,
-                "current_period_end": period_end_iso,
-                "trial_end": trial_end_iso,
-            }, on_conflict="user_id").execute()
+            # Try update first, then insert
+            existing = supabase_request("GET", "subscriptions", params={
+                "user_id": f"eq.{user_id}", "limit": "1"
+            })
+            if existing and len(existing) > 0:
+                supabase_request("PATCH", "subscriptions", data={
+                    "stripe_customer_id": customer_id,
+                    "stripe_subscription_id": sub["id"],
+                    "plan": plan,
+                    "status": status,
+                    "current_period_end": period_end_iso,
+                    "trial_end": trial_end_iso,
+                }, params={"user_id": f"eq.{user_id}"})
+            else:
+                supabase_request("POST", "subscriptions", data={
+                    "user_id": user_id,
+                    "stripe_customer_id": customer_id,
+                    "stripe_subscription_id": sub["id"],
+                    "plan": plan,
+                    "status": status,
+                    "current_period_end": period_end_iso,
+                    "trial_end": trial_end_iso,
+                })
             print(f"Updated subscription for user {user_id}: {plan}")
 
     elif event_type == "customer.subscription.deleted":
@@ -708,10 +740,10 @@ async def stripe_webhook(request: Request):
         user_id = customer.get("metadata", {}).get("user_id")
 
         if user_id:
-            sb.table("subscriptions").update({
+            supabase_request("PATCH", "subscriptions", data={
                 "plan": "free",
                 "status": "canceled",
-            }).eq("user_id", user_id).execute()
+            }, params={"user_id": f"eq.{user_id}"})
             print(f"Canceled subscription for user {user_id}")
 
     return {"status": "ok"}
