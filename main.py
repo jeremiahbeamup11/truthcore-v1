@@ -73,16 +73,6 @@ class AnalyzeRequest(BaseModel):
         v = v.strip()
         if not v.startswith("http://") and not v.startswith("https://"):
             raise ValueError("URL must start with http:// or https://")
-        try:
-            from urllib.parse import urlparse
-            domain = urlparse(v).netloc.lower().lstrip("www.")
-            allowed = [d.lstrip("www.") for d in ALLOWED_DOMAINS]
-            if not any(domain.endswith(d) for d in allowed):
-                raise ValueError("Only TikTok, Instagram, YouTube, and X URLs are supported.")
-        except ValueError:
-            raise
-        except Exception:
-            raise ValueError("Invalid URL format")
         return v
 
 class CheckoutRequest(BaseModel):
