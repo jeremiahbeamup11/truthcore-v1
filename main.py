@@ -44,6 +44,7 @@ VERCEL_PROJECT = os.getenv("VERCEL_PROJECT_NAME", "truthcore-frontend")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"chrome-extension://.*",
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Authorization"],
