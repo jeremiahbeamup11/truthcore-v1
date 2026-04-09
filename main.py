@@ -43,8 +43,8 @@ VERCEL_PROJECT = os.getenv("VERCEL_PROJECT_NAME", "truthcore-frontend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Authorization"],
 )
@@ -139,6 +139,51 @@ def supabase_request(method: str, table: str, data: dict = None, params: dict = 
     except Exception as e:
         print(f"Supabase request error: {e}")
         return None
+
+
+def verify_token(authorization: str | None) -> str | None:
+    """Verify Supabase JWT token and return user_id, or None if invalid."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.replace("Bearer ", "").strip()
+    try:
+        import requests as req
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_SERVICE_KEY")
+        if not url or not key:
+            return None
+        resp = req.get(
+            f"{url}/auth/v1/user",
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {token}",
+            },
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("id")
+        return None
+    except Exception as e:
+        print(f"Token verification error: {e}")
+        return None
+
+def sanitize_url(url: str) -> str:
+    """Sanitize URL to prevent injection attacks."""
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ["http", "https"]:
+        raise ValueError("Only http and https URLs are allowed")
+    hostname = parsed.hostname or ""
+    blocked = ["localhost", "127.0.0.1", "0.0.0.0", "169.254", "192.168", "10.", "172."]
+    if any(hostname == b.rstrip(".") or hostname.startswith(b) for b in blocked):
+        raise ValueError("Internal URLs are not allowed")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs with credentials are not allowed")
+    return urllib.parse.urlunparse((
+        parsed.scheme, parsed.netloc, parsed.path,
+        parsed.params, parsed.query, ""
+    ))
 
 def get_user_plan(user_id: str) -> str:
     """Returns 'pro' or 'free' for a given user."""
@@ -746,11 +791,15 @@ async def analyze_article(request: Request, body: AnalyzeRequest):
     perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
     if not perplexity_api_key:
         raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
-
-    plan = get_user_plan(body.user_id) if body.user_id else "free"
-
-    if body.user_id:
-        allowed = check_and_increment_usage(body.user_id, plan)
+    try:
+        body.url = sanitize_url(body.url)
+    except ValueError as e:
+        return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0, status=f"error: {str(e)}", plan="free")
+    authorization = request.headers.get("Authorization")
+    user_id = verify_token(authorization)
+    plan = get_user_plan(user_id) if user_id else "free"
+    if user_id:
+        allowed = check_and_increment_usage(user_id, plan)
         if not allowed:
             return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                    status=f"error: {USER_FRIENDLY_ERRORS['limit']}", plan=plan)
@@ -797,11 +846,15 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
     perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
     if not perplexity_api_key:
         raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
-
-    plan = get_user_plan(body.user_id) if body.user_id else "free"
-
-    if body.user_id:
-        allowed = check_and_increment_usage(body.user_id, plan)
+    try:
+        body.url = sanitize_url(body.url)
+    except ValueError as e:
+        return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0, status=f"error: {str(e)}", plan="free")
+    authorization = request.headers.get("Authorization")
+    user_id = verify_token(authorization)
+    plan = get_user_plan(user_id) if user_id else "free"
+    if user_id:
+        allowed = check_and_increment_usage(user_id, plan)
         if not allowed:
             return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                    status=f"error: {USER_FRIENDLY_ERRORS['limit']}", plan=plan)
@@ -859,11 +912,15 @@ async def analyze_x_post(request: Request, body: AnalyzeRequest):
     perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
     if not perplexity_api_key:
         raise HTTPException(status_code=500, detail=USER_FRIENDLY_ERRORS["config"])
-
-    plan = get_user_plan(body.user_id) if body.user_id else "free"
-
-    if body.user_id:
-        allowed = check_and_increment_usage(body.user_id, plan)
+    try:
+        body.url = sanitize_url(body.url)
+    except ValueError as e:
+        return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0, status=f"error: {str(e)}", plan="free")
+    authorization = request.headers.get("Authorization")
+    user_id = verify_token(authorization)
+    plan = get_user_plan(user_id) if user_id else "free"
+    if user_id:
+        allowed = check_and_increment_usage(user_id, plan)
         if not allowed:
             return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                    status=f"error: {USER_FRIENDLY_ERRORS['limit']}", plan=plan)
