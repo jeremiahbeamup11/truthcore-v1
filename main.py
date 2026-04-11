@@ -547,16 +547,22 @@ def extract_json_from_response(raw: str) -> list:
 def extract_claims_from_transcript(transcript: str, api_key: str, max_claims: int = 9) -> list[dict]:
     system_prompt = f"""You are a precise claim-extraction AI. Your ONLY job is to identify specific, verifiable factual claims from content.
 
-Return ONLY a valid JSON array. No markdown, no explanation, no preamble — just the raw JSON array.
+Return ONLY a valid JSON array. No markdown, no explanation, no preamble.
 
-Extract ALL verifiable factual claims present in the content without omitting any. If there are more than {max_claims}, extract the {max_claims} most specific and checkable ones. Be exhaustive — do not selectively pick claims, find every one that exists.
+Extract the {max_claims} most verifiable factual claims. Prioritize claims that:
+- Reference well-known people, organizations, or events that can be searched online
+- Contain specific statistics, numbers, or dates that can be checked
+- Make assertions about historical events, science, health, or politics
+- Would appear in news articles or official records
+
+Avoid:
+- Vague statements without specific verifiable facts
+- Claims about completely unknown private individuals with no searchable context
+- Pure opinions or predictions
+- Claims so obscure they cannot be verified by any web search
 
 Each item must have exactly this format:
-{{"text": "The specific claim made in the content"}}
-
-Focus on: statistics, named entities, historical claims, medical/scientific claims, political claims. Skip opinions and subjective statements.
-
-Reject any claim that is vague, generic, or cannot be verified with a web search. Each claim must contain at least one specific fact: a number, a name, a date, a location, or a direct assertion that can be confirmed or denied."""
+{{"text": "The specific claim made in the content"}}"""
 
     user_prompt = f"""Extract up to {max_claims} verifiable factual claims from this content. Return ONLY a JSON array.
 
@@ -567,8 +573,7 @@ Return format: [{{"text": "claim here"}}, {{"text": "another claim"}}]"""
 
     raw = call_perplexity(api_key, system_prompt, user_prompt)
     print("Raw claims extraction response:", repr(raw[:200]))
-    claims = extract_json_from_response(raw)
-    return claims[:max_claims]
+    return extract_json_from_response(raw)[:max_claims]
 
 def fact_check_claims(claims_text: list[str], api_key: str, model: str = "sonar") -> list[dict]:
     if not claims_text:
@@ -576,22 +581,30 @@ def fact_check_claims(claims_text: list[str], api_key: str, model: str = "sonar"
 
     claims_formatted = "\n".join([f"{i+1}. {c}" for i, c in enumerate(claims_text)])
 
-    system_prompt = """You are a professional fact-checker with access to current information.
+    system_prompt = """You are an elite professional fact-checker with access to real-time web search. Your job is to aggressively verify every claim using live web searches.
 
-Search the web for current information before evaluating each claim. Do not rely on training data alone.
+CRITICAL: Search the web before evaluating each claim. Do not rely on training data alone. Search for the specific claim, named entities, dates, statistics, and related context.
 
 For each claim, determine if it is TRUE, FALSE, MISLEADING, or UNVERIFIED.
-- TRUE: Claim is accurate and verifiable with high confidence
-- FALSE: Claim is demonstrably incorrect
-- MISLEADING: Claim has some truth but omits key context or is framed deceptively
-- UNVERIFIED: Cannot be confirmed or denied with available information
+- TRUE: Claim is accurate and supported by credible sources you found
+- FALSE: Claim is demonstrably incorrect based on evidence you found
+- MISLEADING: Claim has some truth but omits key context, exaggerates, or is framed deceptively
+- UNVERIFIED: LAST RESORT ONLY. Use this only when you have aggressively searched and found zero relevant information. If you find even partial evidence, use TRUE, FALSE, or MISLEADING instead.
 
-Confidence scoring guide:
-- 0.9-1.0: Widely documented, multiple authoritative sources
-- 0.7-0.89: Well supported but minor uncertainty
-- 0.5-0.69: Some evidence but significant gaps
+Before marking anything UNVERIFIED you must:
+1. Search for the specific claim using multiple search queries
+2. Search for the named people, organizations, dates, or statistics mentioned
+3. Search for related news or context around the topic
+4. Only mark UNVERIFIED if absolutely no relevant information exists anywhere
+
+Most claims CAN be verified or refuted with proper searching. Minimize UNVERIFIED verdicts.
+
+Confidence scoring:
+- 0.9-1.0: Multiple authoritative sources confirm
+- 0.7-0.89: Strong evidence with minor uncertainty
+- 0.5-0.69: Some evidence but notable gaps
 - 0.3-0.49: Weak or conflicting evidence
-- 0.1-0.29: Very little basis, mostly speculation
+- 0.1-0.29: Minimal basis found after thorough search
 
 Return ONLY a valid JSON array. No markdown, no explanation, no preamble.
 
@@ -600,7 +613,7 @@ Each item must have exactly this format:
   "text": "the original claim",
   "verdict": "true" | "false" | "misleading" | "unverified",
   "confidence": 0.0-1.0,
-  "explanation": "2-3 sentences explaining your verdict with specific reasoning",
+  "explanation": "2-3 sentences explaining your verdict with specific evidence you found",
   "sources": ["https://actual-url-of-source.com", "https://second-source-url.com"]
 }"""
 
@@ -612,6 +625,7 @@ Claims to fact-check:
     raw = call_perplexity(api_key, system_prompt, user_prompt, model=model)
     print("Raw fact-check response:", repr(raw[:300]))
     return extract_json_from_response(raw)
+
 
 def run_analysis(content: str, api_key: str, plan: str) -> list[Claim]:
     """Run full analysis pipeline with plan-aware limits and model selection."""
