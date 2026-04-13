@@ -106,6 +106,7 @@ USER_FRIENDLY_ERRORS = {
     "no_claims": "No verifiable factual claims were found in this content.",
     "config": "Server configuration error. Please contact support.",
     "limit": "You've reached your monthly analysis limit. Upgrade to Pro for 100 analyses per month.",
+    "unsupported": "That platform isn't supported yet. Try TikTok, Instagram, YouTube, or X.",
 }
 
 def supabase_request(method: str, table: str, data: dict = None, params: dict = None):
@@ -185,6 +186,26 @@ def sanitize_url(url: str) -> str:
         parsed.params, parsed.query, ""
     ))
 
+# ====================== FIX #6: Domain allowlist for social media endpoints ======================
+
+def is_social_media_domain(url: str) -> bool:
+    """Check if URL belongs to a supported social media platform."""
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    return any(hostname == d or hostname.endswith(f".{d}") for d in ALLOWED_DOMAINS)
+
+# ====================== FIX #4: Safe ISO date parsing ======================
+
+def _parse_iso(date_str: str):
+    """Parse ISO date string safely, handling both +00:00 and Z formats."""
+    from datetime import datetime
+    if date_str.endswith("Z"):
+        date_str = date_str[:-1] + "+00:00"
+    return datetime.fromisoformat(date_str)
+
+# ====================== PLAN / USAGE HELPERS ======================
+
 def get_user_plan(user_id: str) -> str:
     """Returns 'pro' or 'free' for a given user."""
     if not user_id:
@@ -202,18 +223,21 @@ def get_user_plan(user_id: str) -> str:
             status = sub.get("status", "inactive")
             period_end = sub.get("current_period_end")
             trial_end = sub.get("trial_end")
-            now = datetime.now(timezone.utc).isoformat()
-            if trial_end and trial_end > now:
+            now = datetime.now(timezone.utc)
+            # FIX #4: proper datetime comparison
+            if trial_end and _parse_iso(trial_end) > now:
                 return "pro"
-            if plan == "pro" and status == "active" and period_end and period_end > now:
+            if plan == "pro" and status == "active" and period_end and _parse_iso(period_end) > now:
                 return "pro"
         return "free"
     except Exception as e:
         print(f"get_user_plan error: {e}")
         return "free"
 
-def check_and_increment_usage(user_id: str, plan: str) -> bool:
-    """Returns True if user is allowed to analyze, False if limit reached."""
+# FIX #3: Split into check_usage (before analysis) and increment_usage (after success)
+
+def check_usage(user_id: str, plan: str) -> bool:
+    """Returns True if user is within their limit, False if limit reached."""
     if not user_id:
         return True
 
@@ -230,41 +254,69 @@ def check_and_increment_usage(user_id: str, plan: str) -> bool:
         })
 
         if not result or len(result) == 0:
-            # First analysis — create usage record
-            supabase_request("POST", "usage", data={
-                "user_id": user_id,
-                "analyses_this_month": 1,
-                "reset_date": _next_month(now),
-            })
-            print(f"Created usage record for {user_id}")
-            return True
+            return True  # no record yet, they're fine
 
         usage = result[0]
         reset_date = usage.get("reset_date")
         count = usage.get("analyses_this_month", 0)
 
-        # Reset counter if month has passed
-        if reset_date and now.isoformat() > reset_date:
-            supabase_request("PATCH", "usage", data={
-                "analyses_this_month": 1,
-                "reset_date": _next_month(now),
-            }, params={"user_id": f"eq.{user_id}"})
+        # FIX #4: proper datetime comparison
+        if reset_date and now > _parse_iso(reset_date):
             return True
 
         if count >= limit:
             print(f"User {user_id} hit limit: {count}/{limit}")
             return False
 
-        # Increment counter
-        supabase_request("PATCH", "usage", data={
-            "analyses_this_month": count + 1,
-        }, params={"user_id": f"eq.{user_id}"})
-        print(f"Usage incremented for {user_id}: {count + 1}/{limit}")
         return True
 
     except Exception as e:
-        print(f"check_and_increment_usage error: {e}")
+        print(f"check_usage error: {e}")
         return True  # fail open
+
+
+def increment_usage(user_id: str):
+    """Increment usage counter AFTER a successful analysis."""
+    if not user_id:
+        return
+
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+
+        result = supabase_request("GET", "usage", params={
+            "select": "*",
+            "user_id": f"eq.{user_id}",
+            "limit": "1",
+        })
+
+        if not result or len(result) == 0:
+            supabase_request("POST", "usage", data={
+                "user_id": user_id,
+                "analyses_this_month": 1,
+                "reset_date": _next_month(now),
+            })
+            print(f"Created usage record for {user_id}")
+            return
+
+        usage = result[0]
+        reset_date = usage.get("reset_date")
+        count = usage.get("analyses_this_month", 0)
+
+        # FIX #4: proper datetime comparison
+        if reset_date and now > _parse_iso(reset_date):
+            supabase_request("PATCH", "usage", data={
+                "analyses_this_month": 1,
+                "reset_date": _next_month(now),
+            }, params={"user_id": f"eq.{user_id}"})
+        else:
+            supabase_request("PATCH", "usage", data={
+                "analyses_this_month": count + 1,
+            }, params={"user_id": f"eq.{user_id}"})
+            print(f"Usage incremented for {user_id}: {count + 1}")
+
+    except Exception as e:
+        print(f"increment_usage error: {e}")
 
 def _next_month(dt) -> str:
     from datetime import timezone
@@ -274,6 +326,38 @@ def _next_month(dt) -> str:
     day = min(dt.day, calendar.monthrange(year, month)[1])
     from datetime import datetime
     return datetime(year, month, day, tzinfo=timezone.utc).isoformat()
+
+# ====================== FIX #7: Efficient subscription count ======================
+
+def get_subscription_count() -> int:
+    """Get total subscription count using Supabase HEAD request."""
+    import requests as req
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        return 9999  # fail safe, no trial
+    try:
+        resp = req.head(
+            f"{url}/rest/v1/subscriptions",
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Prefer": "count=exact",
+            },
+            params={"select": "id"},
+            timeout=5,
+        )
+        # Supabase returns count in content-range header: "0-N/total"
+        content_range = resp.headers.get("content-range", "")
+        if "/" in content_range:
+            total = content_range.split("/")[-1]
+            if total != "*":
+                return int(total)
+        return 9999  # can't determine, fail safe
+    except Exception:
+        return 9999
+
+# ====================== OTHER HELPERS ======================
 
 def get_cookie_file(env_var: str, filename: str) -> str | None:
     import base64
@@ -482,17 +566,19 @@ def extract_x_content(url: str) -> tuple[str, str | None]:
 
     return combined, transcript
 
-# ====================== IN-MEMORY CACHE ======================
+# ====================== IN-MEMORY CACHE (FIX #2: keyed by plan) ======================
 _analysis_cache: dict = {}
 
-def get_cached_analysis(url: str):
-    if url in _analysis_cache:
-        print(f"Cache hit for URL: {url}")
-        return _analysis_cache[url]
+def get_cached_analysis(url: str, plan: str = "free"):
+    cache_key = f"{plan}:{url}"
+    if cache_key in _analysis_cache:
+        print(f"Cache hit for URL: {url} (plan: {plan})")
+        return _analysis_cache[cache_key]
     return None
 
 def save_analysis_to_cache(url: str, transcript, claims: list, overall_confidence: float, platform: str, plan: str = "free"):
-    _analysis_cache[url] = AnalyzeResponse(
+    cache_key = f"{plan}:{url}"
+    _analysis_cache[cache_key] = AnalyzeResponse(
         url=url,
         transcript=transcript,
         claims=claims,
@@ -500,7 +586,7 @@ def save_analysis_to_cache(url: str, transcript, claims: list, overall_confidenc
         status="success",
         plan=plan,
     )
-    print(f"Saved to in-memory cache: {url}")
+    print(f"Saved to in-memory cache: {url} (plan: {plan})")
 
 # ====================== PERPLEXITY ======================
 
@@ -663,7 +749,7 @@ async def get_plan(user_id: str):
     plan = get_user_plan(user_id)
     return {"plan": plan}
 
-# ====================== STRIPE CHECKOUT ======================
+# ====================== STRIPE CHECKOUT (FIX #7: efficient count) ======================
 
 @app.post("/create-checkout-session")
 async def create_checkout_session(body: CheckoutRequest):
@@ -695,12 +781,9 @@ async def create_checkout_session(body: CheckoutRequest):
             )
             stripe_customer_id = customer.id
 
-        # Determine trial days — first 200 users get 14-day trial
+        # FIX #7: Use efficient count instead of fetching 1000 rows
         trial_days = None
-        count_result = supabase_request("GET", "subscriptions", params={
-            "select": "id", "limit": "1000"
-        })
-        if count_result is not None and len(count_result) < 200:
+        if get_subscription_count() < 200:
             trial_days = 14
 
         session_params = {
@@ -722,7 +805,7 @@ async def create_checkout_session(body: CheckoutRequest):
     except stripe.StripeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# ====================== STRIPE WEBHOOK ======================
+# ====================== STRIPE WEBHOOK (FIX: reject if secret missing) ======================
 
 @app.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
@@ -730,11 +813,15 @@ async def stripe_webhook(request: Request):
     sig_header = request.headers.get("stripe-signature")
     webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
 
+    # FIX: Never accept unverified webhooks in production
+    if not webhook_secret:
+        print("CRITICAL: STRIPE_WEBHOOK_SECRET is not set — rejecting webhook")
+        raise HTTPException(status_code=500, detail="Webhook not configured")
+
     try:
-        if webhook_secret:
-            event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
-        else:
-            event = json.loads(payload)
+        event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+    except stripe.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -797,7 +884,7 @@ async def stripe_webhook(request: Request):
 
     return {"status": "ok"}
 
-# ====================== TEXT ARTICLE ANALYSIS ======================
+# ====================== TEXT ARTICLE ANALYSIS (FIX #3, #5) ======================
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 @limiter.limit("10/minute")
@@ -809,11 +896,19 @@ async def analyze_article(request: Request, body: AnalyzeRequest):
         body.url = sanitize_url(body.url)
     except ValueError as e:
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0, status=f"error: {str(e)}", plan="free")
+
     authorization = request.headers.get("Authorization")
     user_id = verify_token(authorization)
     plan = get_user_plan(user_id) if user_id else "free"
+
+    # FIX #5: Check cache BEFORE usage
+    cached = get_cached_analysis(body.url, plan)
+    if cached:
+        return cached
+
+    # FIX #3: Only check usage (don't increment yet)
     if user_id:
-        allowed = check_and_increment_usage(user_id, plan)
+        allowed = check_usage(user_id, plan)
         if not allowed:
             return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                    status=f"error: {USER_FRIENDLY_ERRORS['limit']}", plan=plan)
@@ -836,20 +931,19 @@ async def analyze_article(request: Request, body: AnalyzeRequest):
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                status="error: No readable text found in that article.", plan=plan)
 
-    cached = get_cached_analysis(body.url)
-    if cached:
-        return cached
-
     try:
         claims = run_analysis(article_text, perplexity_api_key, plan)
         overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
         save_analysis_to_cache(body.url, None, claims, overall_confidence, "article", plan)
+        # FIX #3: Increment usage only AFTER successful analysis
+        if user_id:
+            increment_usage(user_id)
         return AnalyzeResponse(url=body.url, claims=claims, overall_confidence=overall_confidence, status="success", plan=plan)
     except Exception:
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                status="error: Something went wrong during analysis. Please try again.", plan=plan)
 
-# ====================== VIDEO ANALYSIS ======================
+# ====================== VIDEO ANALYSIS (FIX #3, #5, #6) ======================
 
 @app.post("/analyze_video", response_model=AnalyzeResponse)
 @limiter.limit("5/minute")
@@ -864,18 +958,27 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
         body.url = sanitize_url(body.url)
     except ValueError as e:
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0, status=f"error: {str(e)}", plan="free")
+
+    # FIX #6: Enforce domain allowlist for social media endpoints
+    if not is_social_media_domain(body.url):
+        return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
+                               status=f"error: {USER_FRIENDLY_ERRORS['unsupported']}", plan="free")
+
     authorization = request.headers.get("Authorization")
     user_id = verify_token(authorization)
     plan = get_user_plan(user_id) if user_id else "free"
+
+    # FIX #5: Check cache BEFORE usage
+    cached = get_cached_analysis(body.url, plan)
+    if cached:
+        return cached
+
+    # FIX #3: Only check usage (don't increment yet)
     if user_id:
-        allowed = check_and_increment_usage(user_id, plan)
+        allowed = check_usage(user_id, plan)
         if not allowed:
             return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                    status=f"error: {USER_FRIENDLY_ERRORS['limit']}", plan=plan)
-
-    cached = get_cached_analysis(body.url)
-    if cached:
-        return cached
 
     print("\n[Step 1] Downloading audio...")
     audio_file = None
@@ -909,6 +1012,9 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
         overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
         print(f"\n=== Analysis complete. Claims: {len(claims)}, Confidence: {overall_confidence:.2f}, Plan: {plan} ===")
         save_analysis_to_cache(body.url, transcript, claims, overall_confidence, detect_platform(body.url), plan)
+        # FIX #3: Increment usage only AFTER successful analysis
+        if user_id:
+            increment_usage(user_id)
         return AnalyzeResponse(url=body.url, transcript=transcript, claims=claims,
                                overall_confidence=overall_confidence, status="success", plan=plan)
     except Exception as e:
@@ -916,7 +1022,7 @@ async def analyze_video(request: Request, body: AnalyzeRequest):
         return AnalyzeResponse(url=body.url, transcript=transcript, claims=[], overall_confidence=0.0,
                                status=f"error: {USER_FRIENDLY_ERRORS['factcheck']}", plan=plan)
 
-# ====================== X POST ANALYSIS ======================
+# ====================== X POST ANALYSIS (FIX #3, #5, #6) ======================
 
 @app.post("/analyze_x", response_model=AnalyzeResponse)
 @limiter.limit("5/minute")
@@ -930,18 +1036,27 @@ async def analyze_x_post(request: Request, body: AnalyzeRequest):
         body.url = sanitize_url(body.url)
     except ValueError as e:
         return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0, status=f"error: {str(e)}", plan="free")
+
+    # FIX #6: Enforce domain allowlist for social media endpoints
+    if not is_social_media_domain(body.url):
+        return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
+                               status=f"error: {USER_FRIENDLY_ERRORS['unsupported']}", plan="free")
+
     authorization = request.headers.get("Authorization")
     user_id = verify_token(authorization)
     plan = get_user_plan(user_id) if user_id else "free"
+
+    # FIX #5: Check cache BEFORE usage
+    cached = get_cached_analysis(body.url, plan)
+    if cached:
+        return cached
+
+    # FIX #3: Only check usage (don't increment yet)
     if user_id:
-        allowed = check_and_increment_usage(user_id, plan)
+        allowed = check_usage(user_id, plan)
         if not allowed:
             return AnalyzeResponse(url=body.url, claims=[], overall_confidence=0.0,
                                    status=f"error: {USER_FRIENDLY_ERRORS['limit']}", plan=plan)
-
-    cached = get_cached_analysis(body.url)
-    if cached:
-        return cached
 
     print("\n[Step 1] Extracting X post content...")
     try:
@@ -962,6 +1077,9 @@ async def analyze_x_post(request: Request, body: AnalyzeRequest):
         overall_confidence = sum(c.confidence for c in claims) / len(claims) if claims else 0.0
         print(f"\n=== X analysis complete. Claims: {len(claims)}, Confidence: {overall_confidence:.2f}, Plan: {plan} ===")
         save_analysis_to_cache(body.url, transcript, claims, overall_confidence, "x", plan)
+        # FIX #3: Increment usage only AFTER successful analysis
+        if user_id:
+            increment_usage(user_id)
         return AnalyzeResponse(url=body.url, transcript=transcript, claims=claims,
                                overall_confidence=overall_confidence, status="success", plan=plan)
     except Exception as e:
